@@ -67,6 +67,29 @@ def validation_settings() -> Dict[str, Any]:
     return dict(load_config().get("validation", {}) or {})
 
 
+def ui_settings() -> Dict[str, Any]:
+    """`ui:` section of config.yaml (the Streamlit app)."""
+    u = dict(load_config().get("ui", {}) or {})
+    u.setdefault("out_dir", os.getenv("AGENTIC_OUT_DIR", "output"))
+    u.setdefault("max_parallel_jobs", 2)
+    return u
+
+
+def query_settings() -> Dict[str, Any]:
+    """`query:` section of config.yaml: defaults for the UI's read-only Hive / Trino query tab. Passwords are never read
+    from the file: `password_env` names the environment variable that holds one."""
+    q = dict(load_config().get("query", {}) or {})
+    q.setdefault("row_limit", 1000)
+    q.setdefault("max_row_limit", 10000)
+    q.setdefault("timeout_seconds", 120)
+    q.setdefault("log", os.path.join(ui_settings()["out_dir"], "query_log.jsonl"))
+    q["hive"] = {"host": "", "port": 10000, "username": "", "auth": "NONE", "database": "default",
+                 "password_env": "HIVE_PASSWORD", **(q.get("hive") or {})}
+    q["trino"] = {"host": "", "port": 8080, "user": "", "catalog": "hive", "schema": "default", "http_scheme": "http",
+                  "verify": True, "password_env": "TRINO_PASSWORD", **(q.get("trino") or {})}
+    return q
+
+
 def azure_settings() -> Dict[str, Any]:
     """Resolved Azure OpenAI settings (env > config.yaml). Empty values are treated as unset."""
     cfg = load_config().get("azure_openai", {}) or {}

@@ -27,6 +27,7 @@ def main(spec_path: str) -> None:
     spec = json.load(open(spec_path, encoding="utf-8"))
     cluster = spec.get("mode") == "cluster"
     result = {"ok": False, "error": "", "notes": [], "targets": {}}
+    phase = "setup"   # 'setup' = building the session / loading test data (an environment problem, not the script's fault)
     spark = None
     orig_sql = None
     try:
@@ -38,7 +39,9 @@ def main(spec_path: str) -> None:
             for k, v in (spec.get("spark_conf") or {}).items():
                 b = b.config(k, v)
         else:
-            b = b.master("local[2]").config("spark.sql.warehouse.dir", spec["warehouse"])
+            # a private, in-memory catalog: a host's spark-defaults.conf (Hive metastore, cluster master...) must not leak in
+            b = (b.master("local[2]").config("spark.sql.warehouse.dir", spec["warehouse"])
+                 .config("spark.sql.catalogImplementation", "in-memory"))
         spark = (b.config("spark.ui.enabled", "false").config("spark.sql.shuffle.partitions", "2")
                  .config("spark.sql.sources.partitionOverwriteMode", "dynamic").getOrCreate())
         spark.sparkContext.setLogLevel("ERROR")
@@ -140,6 +143,7 @@ def main(spec_path: str) -> None:
                 setattr(DataFrameReader, meth, wrapped)
 
         # ---- run ------------------------------------------------------------------------------
+        phase = "script"   # from here on a failure is the generated script's
         os.environ.update(spec.get("env", {}))
         sys.argv = [spec["script"]] + spec.get("argv", [])
         sys.path.insert(0, os.path.dirname(spec["script"]))
@@ -158,6 +162,7 @@ def main(spec_path: str) -> None:
         result["ok"] = True
     except BaseException:  # report everything, including SystemExit/KeyboardInterrupt
         result["error"] = traceback.format_exc()[-3500:]
+        result["phase"] = phase
     finally:
         if cluster and spark is not None and orig_sql is not None and not spec.get("keep_scratch"):
             try:  # only ever drops the scratch DB created for this run

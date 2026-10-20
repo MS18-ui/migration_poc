@@ -1,13 +1,13 @@
-# Agentic migration framework
+﻿# Agentic migration framework
 
-Legacy jobs → YAML blueprint → PySpark 3.x + Airflow DAG, using tool-calling agents.
+Legacy jobs â†’ YAML blueprint â†’ PySpark 3.x + Airflow DAG, using tool-calling agents.
 
 ```
-Oozie XML ─┐
-PySpark 2  ├─ ingestion agent (per source) ─┐
-Sqoop      │                                ├─► YAML ─► Agentic Framework ─┬─► PySpark 3.x
-Excel     ─┘                                │                              └─► Airflow DAG
-Hive QL ─► Hive→Spark agent ─► Spark SQL ───┘
+Oozie XML â”€â”
+PySpark 2  â”œâ”€ ingestion agent (per source) â”€â”
+Sqoop      â”‚                                â”œâ”€â–º YAML â”€â–º Agentic Framework â”€â”¬â”€â–º PySpark 3.x
+Excel     â”€â”˜                                â”‚                              â””â”€â–º Airflow DAG
+Hive QL â”€â–º Hiveâ†’Spark agent â”€â–º Spark SQL â”€â”€â”€â”˜
 ```
 
 ## Layout
@@ -24,7 +24,12 @@ agentic/
   tools.py                  ToolSpec + ToolRegistry
   agent.py                  ToolAgent loop (observe -> act, message memory)
   agents.py                 ingestion (per source), hive_to_spark, pyspark, airflow agents
-  orchestrator.py           router + 5-stage pipeline + export
+  orchestrator.py           router + 5-stage pipeline; writes each artifact as it is produced
+  events.py                 structured step events (UI / events_<stamp>.jsonl)
+  jobs.py                   background job runner + run history (used by the UI)
+  gitsource.py              read-only git input (shallow https clone, safe paths)
+  query/                    read-only Hive / Trino: guard.py, connectors.py
+ui/app.py                   Streamlit workbench (Migration / Run History / Data Query)
 ```
 
 ## Run
@@ -50,18 +55,56 @@ A pipeline run writes ALL of its files into a single subfolder of the output fol
 change the base), named `run_<YYYYMMDD>_<HHMMSS>`. Files inside are named `<name>_<YYYYMMDD>_<HHMMSS>.<ext>`. A rerun gets
 its own folder, so nothing is overwritten (two runs in the same second get `_2`, `_3`...):
 
+Files are written AS EACH STEP PRODUCES THEM (not only at the end), so a failed run still leaves what it got that far:
+
 ```
 output/
   run_20261020_153045/
-    pipeline_spec_20261020_153045.yaml      generated_pipeline_20261020_153045.py
-    airflow_dag_20261020_153045.py          converted_spark_20261020_153045.sql   (Hive input only)
-    validation_report_20261020_160210.json  validation_report_20261020_160210.md   test_suite_20261020_160210.json
+    input_screened_<stamp>.<ext>        the input as submitted for analysis (credentials masked)
+    converted_spark_<stamp>.sql         Hive QL -> Spark SQL                (Hive input only)
+    blueprint_agent_<stamp>.yaml        the agent's blueprint before the catalog is applied   (when a catalog is used)
+    catalog_metadata_<stamp>.yaml       the catalog snapshot used                             (when a catalog is used)
+    pipeline_spec_<stamp>.yaml          the final YAML blueprint (with findings and provenance)
+    generated_pipeline_<stamp>.py       airflow_dag_<stamp>.py
+    run_meta_<stamp>.json               status, input, model, timings, file list (lets the UI reopen the run)
+    events_<stamp>.jsonl                the step-by-step history                              (runs started from the UI)
+    validation_report_<stamp>.json/.md  test_suite_<stamp>.json               (added by the validator)
 ```
 
 The validator adds its report to the run folder that holds the spec it checks (so one job's results stay together); for a
 spec that lives elsewhere it creates a new `output/run_<stamp>/`. The Airflow DAG submits the timestamped
 `generated_pipeline_<stamp>.py` that was actually written, and a validation report records `spec_file` and `source_file`
 in its summary. `ANTHROPIC_MODEL` overrides the model.
+
+## Web UI
+
+```
+pip install -r requirements.txt                       # streamlit>=1.37, trino  (+ pyhive for Hive, see requirements.txt)
+python -m streamlit run ui/app.py --server.port 8501 --server.address 0.0.0.0     # run from the project root
+```
+
+Open `http://<host>:8501`. To require an access password, set the environment variable `AGENTIC_UI_PASSWORD` before
+starting the application. Service credentials are read from the environment or from `config.yaml`; they are never entered
+on the page, and the interface does not expose provider or model settings.
+
+- **Migration**: upload one or more files, or enter a git repository (HTTPS URL, optional branch or tag, folder and, for
+  private repositories, an access token), select *Retrieve Files* and choose the files to migrate. Advanced options: source
+  type, catalog metadata (configured default, uploaded DDL or YAML, or none) and table aliases. *Start Migration* runs each
+  file as a separate job. The progress panel refreshes every two seconds and shows the five stages, each analysis step with
+  its outcome, each file at the moment it is created (input, blueprint draft, catalog metadata, final YAML, SQL, PySpark
+  script, DAG), the findings recorded in the blueprint, a ZIP download, and a *Validate YAML Blueprint* action (the static
+  checks always; the Spark-backed checks where Spark and Java are available).
+- **Run History**: reopens any earlier `output/run_*` folder with its step history, files and findings.
+- **Data Query (Hive / Trino)**: a connection form (defaults from the `query:` section of `config.yaml`; passwords are
+  entered on the page or read from `HIVE_PASSWORD` / `TRINO_PASSWORD` and are never stored), a schema browser (databases or
+  schemas, tables, table description, 100-row sample), an SQL editor with a row limit and time limit, and CSV download.
+  Access is read-only by construction: exactly one SELECT, WITH, VALUES, SHOW, DESCRIBE or EXPLAIN statement is accepted per
+  execution; write statements, multiple statements, `CALL`, and Hive `TRANSFORM` and `reflect` are rejected before they reach
+  the server. Each query (text, row count, timing and errors, never the results) is appended to `output/query_log.jsonl`.
+  Results are displayed on the page only. A read-only database account should also be used.
+
+The UI is a thin layer over `agentic/jobs.py` (job runner), `agentic/events.py` (step events), `agentic/gitsource.py`
+(read-only git input) and `agentic/query/` (guard + connectors), so a CLI or API can reuse them.
 
 ## LLM providers
 
@@ -150,3 +193,4 @@ What changes in a run:
 - **Provenance** (written by the framework): source sha256, hashes of the skill files used, model, screening count.
 - **Metadata:** the skills expect a catalog metadata snapshot and do not invent schemas, so without one sources may come
   back without schemas (reported as a finding) and the validator's Spark-backed layers cannot execute them.
+

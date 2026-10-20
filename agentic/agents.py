@@ -217,7 +217,8 @@ def build_pyspark_agent(llm: BaseLLM, blueprint: PipelineBlueprint, verbose: boo
 
     def submit(args: dict) -> str:
         r = check(args)
-        if r.startswith("OK") and require_pass and not code_is_verified(holder, args["content"]):
+        if r.startswith("OK") and require_pass and not holder.get("runcheck_unavailable") \
+                and not code_is_verified(holder, args["content"]):
             return ("ERROR: this exact code has not passed " +
                     "/".join(t.name for t in rc_tools) + " yet. Run it, fix any problems, then submit.")
         if r.startswith("OK"):

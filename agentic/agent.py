@@ -1,8 +1,15 @@
 import re
 from typing import Any, List, Optional
 
+from . import events
 from .llm import BaseLLM, ToolResult
 from .tools import ToolRegistry
+
+
+def _clip(text: str, head: int, tail: int) -> str:
+    """Keep the start AND the end of a long tool result: for a traceback the end holds the actual exception."""
+    text = (text or "").strip()
+    return text if len(text) <= head + tail else text[:head] + "\n...\n" + text[-tail:]
 
 
 def _extract_artifact(text: str) -> str:
@@ -27,9 +34,11 @@ class ToolAgent:
         self.abort: Optional[str] = None  # a tool may set this to stop the loop with a reason (e.g. correction limit)
         self.auto_submit = False          # generation agents: a plain-text artifact reply is routed through submit_final
 
-    def _log(self, msg: str):
+    def _log(self, msg: str, emit_event: bool = True):
         if self.verbose:
             print(f"   [{self.name}] {msg}")
+        if emit_event:
+            events.emit("log", agent=self.name, message=msg)
 
     def run(self, task: str) -> Any:
         self.history = [self.llm.user_message(task)]
@@ -40,11 +49,13 @@ class ToolAgent:
             self.history.append(self.llm.assistant_message(resp))
 
             if not resp.tool_calls:
-                if self.auto_submit and resp.text.strip():
-                    # The model answered with the artifact as plain text. Route it through the SAME validators
-                    # (submit_final re-checks everything); it is never accepted unvalidated.
+                if self.auto_submit and "```" in resp.text:
+                    # The model answered with the artifact as a fenced code block instead of a tool call. Route it
+                    # through the SAME validators (submit_final re-checks everything); never accepted unvalidated.
+                    # (A plain-prose reply is NOT submitted: it is an explanation, not an artifact.)
                     output, is_error = self.tools.dispatch("submit_final", {"content": _extract_artifact(resp.text)})
-                    self._log(f"turn {turn}: text reply submitted -> {'REJECTED: ' + output[:160] if is_error else 'ok'}")
+                    self._log(f"turn {turn}: text reply submitted -> "
+                              f"{'REJECTED: ' + _clip(output, 140, 260).replace(chr(10), ' ') if is_error else 'ok'}")
                     if self.final is not None:
                         self._log(f"accepted on turn {turn}")
                         return self.final
@@ -62,7 +73,10 @@ class ToolAgent:
             results = []
             for call in resp.tool_calls:
                 output, is_error = self.tools.dispatch(call.name, call.args)
-                self._log(f"turn {turn}: {call.name} -> {'REJECTED: ' + output[:160] if is_error else 'ok'}")
+                self._log(f"turn {turn}: {call.name} -> "
+                          f"{'REJECTED: ' + _clip(output, 140, 260).replace(chr(10), ' ') if is_error else 'ok'}", emit_event=False)
+                events.emit("tool", agent=self.name, turn=turn, tool=call.name, ok=not is_error,
+                            detail=_clip(output, 300, 1500) if is_error else output[:300])
                 results.append(ToolResult(call.id, output, is_error))
             self.history.extend(self.llm.tool_result_messages(results))
 

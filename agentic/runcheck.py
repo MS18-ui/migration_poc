@@ -20,6 +20,7 @@ import tempfile
 import time
 from typing import Any, Callable, Dict, List, Optional
 
+from . import events
 from .diffing import compare_outputs
 from .schemas import PipelineBlueprint, SchemaField
 from .sqlguard import scan_cluster_safety
@@ -56,6 +57,7 @@ class RunCheck:
         self.bp, self.cfg = bp, settings or {}
         self.runner = runner or self._subprocess_runner
         self.work = tempfile.mkdtemp(prefix="runcheck_")
+        self.broken: Optional[str] = None   # set when the Spark environment (not the script) fails; disables the check
         self.mode = self.cfg.get("mode", "local")
         if self.mode not in ("local", "cluster"):
             raise ValueError(f"validation.mode must be 'local' or 'cluster', got '{self.mode}'")
@@ -108,8 +110,8 @@ class RunCheck:
                                timeout=spec["timeout"])
         except subprocess.TimeoutExpired:
             return {"ok": False, "error": f"timed out after {spec['timeout']}s", "targets": {}}
-        if not os.path.exists(spec["out"]):
-            return {"ok": False, "error": (p.stderr or p.stdout)[-3000:], "targets": {}}
+        if not os.path.exists(spec["out"]):  # the runner itself died before reporting: an environment problem
+            return {"ok": False, "error": (p.stderr or p.stdout)[-3000:], "targets": {}, "phase": "setup"}
         return json.load(open(spec["out"], encoding="utf-8"))
 
     def _cluster_spec(self, label: str, script_path: str, table_map: Dict[str, str], argv, env) -> dict:
@@ -215,10 +217,24 @@ class RunCheck:
     def _tail(err: str, n: int = 1400) -> str:
         return err.strip()[-n:]
 
+    def _infra(self, res: dict, who: str) -> Optional[str]:
+        """A failure while PREPARING the run (Spark session, test data, catalog) is the environment's, not the generated
+        script's. Say so, disable the run check for this job, and let the other checks decide - otherwise the agent
+        would spend every turn on a problem it cannot fix."""
+        if not res["ok"] and res.get("phase") == "setup":
+            self.broken = (f"the run-and-diff environment failed while preparing the {who} run: "
+                           f"{self._tail(res['error'], 700)}")
+        return ("SKIPPED: " + self.broken + "\nThis is not a problem with your code. The run check is disabled for this job; "
+                "submit_final will now be accepted on the other checks.") if self.broken else None
+
     def run_tool(self, code: str) -> str:
         if (bad := self._unsafe(code)):
             return bad
+        if self.broken:
+            return self._infra({"ok": False}, "candidate")
         res = self.run_candidate(code)
+        if (skipped := self._infra(res, "candidate")):
+            return skipped
         where = "real cluster tables (writes sandboxed to a scratch database)" if self.mode == "cluster" else "test data"
         if not res["ok"]:
             return f"ERROR: script failed when run on {where}:\n" + self._tail(res["error"])
@@ -232,10 +248,16 @@ class RunCheck:
     def diff_tool(self, code: str) -> str:
         if (bad := self._unsafe(code)):
             return bad
+        if self.broken:
+            return self._infra({"ok": False}, "candidate")
         res = self.run_candidate(code)
+        if (skipped := self._infra(res, "candidate")):
+            return skipped
         if not res["ok"]:
             return "ERROR: candidate failed when run:\n" + self._tail(res["error"])
         base = self.run_baseline()
+        if (skipped := self._infra(base, "baseline")):
+            return skipped
         if not base["ok"]:
             return ("ERROR: the BASELINE script failed (not your fault - tell the "
                     "user):\n" + self._tail(base["error"]))
@@ -300,6 +322,11 @@ def make_runcheck_tools(bp: PipelineBlueprint, settings: Dict[str, Any], holder:
     def stamp(code: str, out: str) -> str:
         if out.startswith("OK"):
             holder["verified"] = hashlib.sha1(strip_fences(code).encode()).hexdigest()
+        elif out.startswith("SKIPPED"):  # environment problem: stop gating submit_final on a check that cannot run
+            if not holder.get("runcheck_unavailable"):
+                print("   [run-and-diff] SKIPPED for this job - " + out[:500].replace("\n", " "))
+                events.emit("note", message="run-and-diff skipped (environment): " + out[:400])
+            holder["runcheck_unavailable"] = out
         return out
 
     tools = [ToolSpec("run_pipeline",

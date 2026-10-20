@@ -87,3 +87,32 @@ metadata:
   aliases: {}
 
 
+
+# Web UI (python -m streamlit run ui/app.py): upload a job or pick one from a git repo, watch each step and file, query Hive/Trino.
+ui:
+  out_dir: output               # base folder; each migration writes into output/run_<stamp>/
+  max_parallel_jobs: 2          # migrations/validations running at the same time
+
+# Read-only query tab. Hosts are blank until you fill them in (here or in the UI). Passwords are NEVER stored in this
+# file: type one in the UI, or export the environment variable named by password_env before starting the UI.
+# Only one SELECT/WITH/SHOW/DESCRIBE/EXPLAIN statement is accepted; results are capped and are never sent to the LLM.
+query:
+  row_limit: 1000
+  max_row_limit: 10000
+  timeout_seconds: 120
+  hive:                         # HiveServer2 (PyHive)
+    host: ""
+    port: 10000
+    username: ""
+    auth: NONE                  # NONE | LDAP | CUSTOM | KERBEROS
+    database: default
+    password_env: HIVE_PASSWORD
+  trino:
+    host: ""
+    port: 8080
+    user: ""
+    catalog: hive
+    schema: default
+    http_scheme: http           # https is required if you use a password
+    verify: true                # TLS certificate check
+    password_env: TRINO_PASSWORD

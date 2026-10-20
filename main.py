@@ -1,6 +1,6 @@
 import argparse
 
-from agentic import AgenticFramework, create_llm
+from agentic import AgenticFramework, create_llm, events
 from agentic.config import metadata_settings
 from agentic.metadata import load_snapshot
 
@@ -31,5 +31,7 @@ if __name__ == "__main__":
         print(f"[metadata] snapshot {snapshot.id}: {len(snapshot.tables)} table(s) from {', '.join(snapshot.files)}")
         for w in snapshot.warnings:
             print("[metadata] warning:", w)
+    # record the step-by-step history (incl. full error text) in output/run_<stamp>/events_<stamp>.jsonl, like the UI does
+    events.bind(events.RunEvents())
     AgenticFramework(a.input, create_llm(a.provider), out_dir=a.out, source_type=a.type,
                      snapshot=snapshot, aliases=aliases).run()

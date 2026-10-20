@@ -9,3 +9,9 @@ azure-identity      # optional: Entra ID (keyless) auth for Azure OpenAI
 
 # Validation agent: the Spark-backed layers need pyspark + Java (use the cluster host, which already has them)
 # pyspark
+
+# Web UI (python -m streamlit run ui/app.py)
+streamlit>=1.37            # 1.37+ for auto-refreshing progress panels (st.fragment)
+trino                      # Trino queries in the UI
+# Hive queries in the UI need PyHive; the pure-Python SASL extra avoids compiling libsasl:
+#   pip install "pyhive[hive_pure_sasl]"
