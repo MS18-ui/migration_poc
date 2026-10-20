@@ -18,7 +18,8 @@ if __name__ == "__main__":
     p.add_argument("--metadata-alias", action="append", default=[], metavar="JOB_NAME=CATALOG_NAME",
                    help="explicit table alias, used only when the job's name differs from the catalog's (repeatable)")
     p.add_argument("--out", default="output",
-                   help="output folder for all files (default: output); names are <name>_<YYYYMMDD>_<HHMMSS>.<ext>")
+                   help="base output folder (default: output). Each run writes all its files into one subfolder, "
+                        "<out>/run_<YYYYMMDD>_<HHMMSS>/, named <name>_<YYYYMMDD>_<HHMMSS>.<ext>")
     a = p.parse_args()
 
     cfg = metadata_settings()

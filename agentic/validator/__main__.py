@@ -6,6 +6,7 @@ import argparse
 import os
 import sys
 
+from ..outputs import validation_dir
 from ..validation import ValidationEngine
 from .pipeline import Session, run_validation, write_outputs
 
@@ -14,8 +15,9 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="agentic.validator", description="Validate that a blueprint YAML captures all source logic")
     ap.add_argument("--spec", required=True, help="blueprint YAML (rich format)")
     ap.add_argument("--source", required=True, help="legacy source (.py PySpark or .hql/.sql)")
-    ap.add_argument("--out", default="output",
-                    help="output folder (default: output, shared with the pipeline's outputs); files are named "
+    ap.add_argument("--out", default=None,
+                    help="folder to write the report into. Default: the run folder (output/run_<stamp>/) that already "
+                         "holds --spec, or a new output/run_<stamp>/ if the spec lives elsewhere. Files are named "
                          "<name>_<YYYYMMDD>_<HHMMSS>.<ext>")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--n-random", type=int, default=10, help="random multi-row scenarios per node")
@@ -42,6 +44,7 @@ def main(argv=None) -> int:
     mpaths = mcfg["snapshot"] if a.metadata is None else a.metadata
     mpaths = [mpaths] if isinstance(mpaths, str) else [x for x in (mpaths or []) if x]
     snapshot = load_snapshot(*mpaths) if mpaths else None
+    a.out = a.out or validation_dir(a.spec)  # the spec's own run folder, so one job's files stay together
     say = (lambda m: None) if a.quiet else (lambda m: print("  ..", m))
     meta = {"spec_file": os.path.basename(a.spec), "source_file": os.path.basename(a.source)}  # what this report is about
     if a.agent == "none":

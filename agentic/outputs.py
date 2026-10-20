@@ -1,13 +1,17 @@
-"""One output folder, timestamped file names.
+"""One folder per run, inside the output folder; timestamped file names.
 
-Every run writes into the same folder (default `output/`) and names each file `<name>_<YYYYMMDD>_<HHMMSS>.<ext>`,
-e.g. `pipeline_spec_20261020_153045.yaml`. Files from one run share one stamp, so they can be matched, and a rerun
-never overwrites an earlier one.
+A run writes ALL its files into a single subfolder of the output folder (default `output/`):
+
+    output/run_20261020_153045/
+        pipeline_spec_20261020_153045.yaml   generated_pipeline_20261020_153045.py   airflow_dag_20261020_153045.py
+        validation_report_20261020_160210.md ...   (validator reports are added to the folder of the spec they check)
+
+File names are `<name>_<YYYYMMDD>_<HHMMSS>.<ext>`. A rerun gets its own folder, so nothing is ever overwritten.
 """
 import os
 import re
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Tuple
 
 
 def stamp_now(now: Optional[datetime] = None) -> str:
@@ -28,3 +32,21 @@ def unique_stamp(out_dir: str, stamp: str) -> str:
 
 def out_name(base: str, stamp: str, ext: str) -> str:
     return f"{base}_{stamp}.{ext.lstrip('.')}"
+
+
+def new_run_dir(base_dir: str, stamp: str) -> Tuple[str, str]:
+    """Create `base_dir/run_<stamp>` (the stamp is made unique among existing entries) and return (path, stamp)."""
+    os.makedirs(base_dir, exist_ok=True)
+    stamp = unique_stamp(base_dir, stamp)
+    path = os.path.join(base_dir, f"run_{stamp}")
+    os.makedirs(path, exist_ok=True)
+    return path, stamp
+
+
+def validation_dir(spec_path: str, base_dir: str = "output") -> str:
+    """Where a validator run should write: the run folder that already holds the spec it checks; for a spec
+    that lives elsewhere, a fresh run folder under `base_dir`."""
+    parent = os.path.dirname(os.path.abspath(spec_path))
+    if os.path.basename(parent).startswith("run_"):
+        return parent
+    return new_run_dir(base_dir, stamp_now())[0]

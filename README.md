@@ -44,22 +44,24 @@ All settings live in `config.yaml` (LLM provider and endpoint, metadata snapshot
 no secrets); with no `config.yaml` present it is used automatically. To customise: `cp config.example.yaml config.yaml`
 and edit it. Put keys in the environment (`AZURE_OPENAI_API_KEY`, `ANTHROPIC_API_KEY`), not in the file.
 
-### Outputs: one folder, timestamped names
+### Outputs: one folder per run, inside `output/`
 
-Every run (pipeline and validator) writes into the same folder, `output/` by default (`--out DIR` to change it), and names
-each file `<name>_<YYYYMMDD>_<HHMMSS>.<ext>`. Files from one run share one stamp; a rerun never overwrites an earlier one
-(two runs in the same second get `_2`, `_3`...):
+A pipeline run writes ALL of its files into a single subfolder of the output folder (`output/` by default, `--out DIR` to
+change the base), named `run_<YYYYMMDD>_<HHMMSS>`. Files inside are named `<name>_<YYYYMMDD>_<HHMMSS>.<ext>`. A rerun gets
+its own folder, so nothing is overwritten (two runs in the same second get `_2`, `_3`...):
 
 ```
 output/
-  pipeline_spec_20261020_153045.yaml      generated_pipeline_20261020_153045.py
-  airflow_dag_20261020_153045.py          converted_spark_20261020_153045.sql   (Hive input only)
-  validation_report_20261020_160210.json  validation_report_20261020_160210.md   test_suite_20261020_160210.json
+  run_20261020_153045/
+    pipeline_spec_20261020_153045.yaml      generated_pipeline_20261020_153045.py
+    airflow_dag_20261020_153045.py          converted_spark_20261020_153045.sql   (Hive input only)
+    validation_report_20261020_160210.json  validation_report_20261020_160210.md   test_suite_20261020_160210.json
 ```
 
-The Airflow DAG submits the timestamped `generated_pipeline_<stamp>.py` that was actually written. A validation report
-records `spec_file` and `source_file` in its summary so it can be matched to the spec it checked.
-`ANTHROPIC_MODEL` overrides the model.
+The validator adds its report to the run folder that holds the spec it checks (so one job's results stay together); for a
+spec that lives elsewhere it creates a new `output/run_<stamp>/`. The Airflow DAG submits the timestamped
+`generated_pipeline_<stamp>.py` that was actually written, and a validation report records `spec_file` and `source_file`
+in its summary. `ANTHROPIC_MODEL` overrides the model.
 
 ## LLM providers
 
@@ -89,12 +91,12 @@ Add a source: add a profile in `agents.py::_SOURCE_PROFILES` and an extension in
 ## Validation agent (does the YAML capture all the source logic?)
 
 ```
-python -m agentic.validator --spec output/pipeline_spec_<stamp>.yaml --source samples/legacy_job.py   # report goes to output/
+python -m agentic.validator --spec output/run_<stamp>/pipeline_spec_<stamp>.yaml --source samples/legacy_job.py   # report goes into that run folder
 python -m agentic.validator ... --agent offline     # scripted review loop, no network
 python -m agentic.validator ... --agent llm         # LLM review (provider from config.yaml)
 ```
 
-Writes `validation_report_<stamp>.md/.json` and `test_suite_<stamp>.json` (the minimized scenarios, with what each one kills) into `output/`.
+Writes `validation_report_<stamp>.md/.json` and `test_suite_<stamp>.json` (the minimized scenarios, with what each one kills) into the spec's run folder.
 Result is **PASSED** / **FAILED** (error findings) / **INCOMPLETE** (a layer did not run); exit codes 0 / 1 / 3.
 
 | Layer | Needs Spark? | What it checks |

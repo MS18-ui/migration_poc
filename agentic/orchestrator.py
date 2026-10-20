@@ -10,7 +10,7 @@ from .agents import (build_airflow_agent, build_hive_to_spark_agent,
 from .llm import BaseLLM
 from .schemas import PipelineBlueprint
 from .metadata import Snapshot, apply_snapshot
-from .outputs import out_name, stamp_now, unique_stamp
+from .outputs import new_run_dir, out_name, stamp_now
 from .secrets import redact_secrets
 from .skills_loader import skill_provenance
 from .validation import ValidationEngine
@@ -50,6 +50,7 @@ class AgenticFramework:
         self.snapshot, self.aliases = snapshot, aliases or {}   # catalog metadata (optional)
         self.stamp = stamp_now()    # run start time; names every output file of this run
         self.output_files: list = []
+        self.run_dir = ""           # <out_dir>/run_<stamp>, set at export
         self.raw_input = ""
         self.model_text = ""        # what the models see: raw_input after local secret screening
         self.redactions = 0
@@ -162,8 +163,9 @@ class AgenticFramework:
     # 5 -------------------------------------------------------------------------------
     def export_production_artifacts(self):
         print("[5/5 Export] Writing outputs...")
-        os.makedirs(self.out_dir, exist_ok=True)
-        stamp = unique_stamp(self.out_dir, self.stamp)  # one folder, `<name>_<date>_<time>`; never overwrites a prior run
+        # ALL of this run's files go into one subfolder of the output folder: <out>/run_<stamp>/
+        run_dir, stamp = new_run_dir(self.out_dir, self.stamp)
+        self.run_dir = run_dir
         spark_name = out_name("generated_pipeline", stamp, "py")
         files = {
             out_name("pipeline_spec", stamp, "yaml"): yaml.dump(self.blueprint.to_dict(), sort_keys=False),
@@ -174,10 +176,10 @@ class AgenticFramework:
         if self.spark_sql:
             files[out_name("converted_spark", stamp, "sql")] = self.spark_sql + "\n"
         for name, content in files.items():
-            with open(os.path.join(self.out_dir, name), "w", encoding="utf-8") as f:
+            with open(os.path.join(run_dir, name), "w", encoding="utf-8") as f:
                 f.write(content)
-        self.output_files = [os.path.join(self.out_dir, n) for n in files]
-        print(f">> Wrote {', '.join(files)} to {self.out_dir}/")
+        self.output_files = [os.path.join(run_dir, n) for n in files]
+        print(f">> Wrote {', '.join(files)} to {run_dir}/")
 
     def run(self):
         self.load_input()
