@@ -46,6 +46,19 @@ class SqlGuard(unittest.TestCase):
     def test_split_respects_quotes(self):
         self.assertEqual(len(split_statements("SELECT ';'; SELECT 2")), 2)
 
+    def test_apostrophe_in_a_comment_cannot_hide_a_following_statement(self):
+        for sql in ("-- it's fine\nSELECT 1; DROP TABLE curated.accounts",
+                    "/* don't */ SELECT 1; DROP TABLE curated.accounts",
+                    "SELECT 1 -- the job's table\n; DROP TABLE curated.accounts"):
+            with self.subTest(sql=sql):
+                self.assertEqual(len([s for s in split_statements(sql) if s.strip()]), 2)
+                with self.assertRaises(PermissionError):
+                    check_sql(sql, S)
+
+    def test_comment_markers_inside_strings_are_kept(self):
+        self.assertEqual(len(split_statements("SELECT '-- not a comment'; SELECT '/* nor this */'")), 2)
+        check_sql("SELECT '-- x' FROM curated.t", S)
+
     def test_code_scan(self):
         bad = scan_cluster_safety("import subprocess\nspark._jvm.x()\ndf.write.jdbc(u,t)\nimport os\nos.system('x')")
         self.assertGreaterEqual(len(bad), 4)

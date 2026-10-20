@@ -74,6 +74,44 @@ def target_type_findings(bp: PipelineBlueprint, engine: Engine) -> List[Finding]
     return out
 
 
+_SEV_MAP = {"info": "info", "low": "info", "medium": "warning", "high": "warning", "critical": "warning"}
+
+
+def analysis_findings(bp: PipelineBlueprint) -> List[Finding]:
+    """The analysis agent's own findings (blueprint.findings), shown alongside the validator's. They are known
+    limitations / assumptions, not validator-detected defects, so they never exceed 'warning'; 'blocks' is kept
+    so a reviewer can see what each one holds up."""
+    out = []
+    for f in bp.findings:
+        if not isinstance(f, dict):
+            continue
+        fid = str(f.get("id", "?"))
+        out.append(Finding(
+            f"analysis-{f.get('category', 'unknown')}", _SEV_MAP.get(f.get("severity"), "warning"),
+            f"[{fid}] {str(f.get('evidence') or f.get('summary') or '')[:420]}",
+            node=(f.get("affected_refs") or [None])[0], source_location=f.get("source_ref"),
+            confidence=f.get("confidence", "medium"), origin="deterministic" if fid == "F-REDACT" else "llm",
+            impact="blocks: " + (", ".join(f.get("blocks") or []) or "nothing"), resolution=str(f.get("resolution", "")),
+            evidence={"severity": f.get("severity"), "status": f.get("status", "open")}))
+    return out
+
+
+def metadata_findings(bp: PipelineBlueprint, snapshot, aliases=None) -> List[Finding]:
+    """Re-check the blueprint against the catalog snapshot (deterministic; works on a copy). A blueprint that already
+    went through the resolver yields nothing here unless it has drifted from the snapshot since."""
+    from ..metadata import apply_snapshot
+    copy = bp.model_copy(deep=True)
+    n = len(copy.findings)
+    apply_snapshot(copy, snapshot, aliases)
+    out = []
+    for f in copy.findings[n:]:
+        hard = "does not exist in catalog table" in f["evidence"]
+        out.append(Finding("metadata", "error" if hard else "warning", f["evidence"], node=(f.get("affected_refs") or [None])[0],
+                           confidence="high", impact="blocks: " + ", ".join(f.get("blocks") or []),
+                           resolution=f.get("resolution", "")))
+    return out
+
+
 def contract_findings(bp: PipelineBlueprint) -> List[Finding]:
     try:
         check_rich_blueprint(bp)
@@ -96,10 +134,13 @@ def ignored_field_findings(bp: PipelineBlueprint) -> List[Finding]:
 
 
 def run_static(bp: PipelineBlueprint, source_text: str, source_path: str, lang: str = None,
-               engine: Optional[Engine] = None) -> Tuple[List[Finding], List[Dict], Optional[Engine]]:
+               engine: Optional[Engine] = None, snapshot=None, aliases=None) -> Tuple[List[Finding], List[Dict], Optional[Engine]]:
     lang = lang or detect_lang(source_path, source_text)
     findings: List[Finding] = []
     findings += contract_findings(bp)
+    findings += analysis_findings(bp)
+    if snapshot is not None:
+        findings += metadata_findings(bp, snapshot, aliases)
     findings += shape_findings(bp)
     why = None if engine is not None else spark_unavailable_reason()
     if engine is None and why is None:

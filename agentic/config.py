@@ -29,6 +29,23 @@ def anthropic_settings() -> Dict[str, Any]:
     }
 
 
+def metadata_settings() -> Dict[str, Any]:
+    """`metadata:` section of config.yaml: the catalog snapshot (file/folder) and explicit table aliases.
+    (Unrelated to validation.baseline_table_map, which names the BASELINE script's tables.)"""
+    m = dict(load_config().get("metadata", {}) or {})
+    m.setdefault("snapshot", None)
+    m["aliases"] = dict(m.get("aliases") or {})
+    return m
+
+
+def skills_settings() -> Dict[str, Any]:
+    """`skills:` section of config.yaml (Type Exchange skills used as ingestion-agent prompts)."""
+    cfg = dict(load_config().get("skills", {}) or {})
+    cfg.setdefault("enabled", True)
+    cfg.setdefault("max_corrections", 2)  # PLAN.md: at most two correction attempts after the first draft
+    return cfg
+
+
 def validator_settings() -> Dict[str, Any]:
     """`validator:` section of config.yaml (Spark session used by the validation agent)."""
     cfg = dict(load_config().get("validator", {}) or {})

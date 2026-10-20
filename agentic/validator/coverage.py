@@ -506,6 +506,10 @@ def yaml_facts(bp: PipelineBlueprint) -> Tuple[Facts, Dict[str, Set[str]]]:
     for tg in bp.targets:
         f.writes.append((tg.object or tg.path or "", tg.mode or "", 0))
     for node_id, text in texts:
+        # names defined INSIDE an expression: `... AS name` and named_struct('name', ...) keys
+        f.created += [(m, 0) for m in re.findall(r"(?i)\bAS\s+`?(\w+)`?", text)]
+        for call in re.finditer(r"(?is)named_struct\s*\((.*)\)", text):
+            f.created += [(k, 0) for k in re.findall(r"'(\w+)'\s*,", call.group(1))]
         before = (len(f.nums), len(f.strs))
         _expr_text_facts(f, text, 0)
         for n, _ in f.nums[before[0]:]:

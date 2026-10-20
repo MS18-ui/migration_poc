@@ -56,8 +56,38 @@ def assert_scratch_table(name: str, scratch_db: str, what: str = "write") -> Non
             f"automatically) and use fully qualified names.")
 
 
+def strip_comments(sql: str) -> str:
+    """Remove `-- ...` and `/* ... */` comments that are not inside a quoted string. Comments must go BEFORE
+    statement splitting: an apostrophe in a comment ("-- it's") would otherwise look like an open quote and hide
+    every following ';' (and so a following DROP) inside one harmless-looking statement."""
+    out, i, n, quote = [], 0, len(sql), None
+    while i < n:
+        ch = sql[i]
+        if quote:
+            out.append(ch)
+            if ch == quote:
+                quote = None
+            i += 1
+        elif ch in ("'", '"', "`"):
+            quote = ch
+            out.append(ch)
+            i += 1
+        elif sql.startswith("--", i):
+            j = sql.find("\n", i)
+            i = n if j == -1 else j
+        elif sql.startswith("/*", i):
+            j = sql.find("*/", i + 2)
+            i = n if j == -1 else j + 2
+            out.append(" ")
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
 def split_statements(sql: str) -> List[str]:
-    """Split on ';' that is not inside a quoted string or backticks."""
+    """Split on ';' that is not inside a quoted string or backticks (comments are removed first)."""
+    sql = strip_comments(sql)
     out, cur, quote = [], [], None
     for ch in sql:
         if quote:

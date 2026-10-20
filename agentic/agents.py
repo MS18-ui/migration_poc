@@ -12,11 +12,12 @@ import yaml
 from pydantic import ValidationError
 
 from .agent import ToolAgent
-from .config import validation_settings
+from .config import skills_settings, validation_settings
 from .llm import BaseLLM
 from .parsers import parse_oozie_workflow, parse_sqoop_command, scan_pyspark2
 from .runcheck import code_is_verified, make_runcheck_tools, spark_available
 from .schemas import PipelineBlueprint
+from .skills_loader import compose_prompt
 from .tools import ToolRegistry, ToolSpec
 from .validation import ValidationEngine, strip_fences
 
@@ -108,6 +109,20 @@ _SOURCE_PROFILES: Dict[str, Dict] = {
 }
 
 
+def _count_failure(holder: Dict, error: str) -> str:
+    """Enforce 'initial draft + at most N correction attempts' (PLAN.md section 1; skills: bounded repair loop).
+    After the limit the agent loop stops with the unresolved problems, which then need manual review."""
+    max_c = holder.get("max_corrections")
+    holder["failures"] = holder.get("failures", 0) + 1
+    holder["last_error"] = error
+    if max_c is not None and holder["failures"] > max_c:
+        holder["agent"].abort = (f"validation still failing after the first draft and {max_c} correction attempt(s); "
+                                 f"unresolved: {error[:700]}")
+        return error + f"\n\nCORRECTION LIMIT REACHED ({max_c}); no further attempts are allowed."
+    left = None if max_c is None else max_c - holder["failures"] + 1
+    return error + ("" if left is None else f"\n\n({left} correction attempt(s) left.)")
+
+
 def _structured_tools(holder: Dict) -> List[ToolSpec]:
     def validate(args: dict) -> str:
         try:
@@ -115,7 +130,7 @@ def _structured_tools(holder: Dict) -> List[ToolSpec]:
             ValidationEngine.validate_logical_dag(bp)
             return f"OK: valid blueprint '{bp.name}' with {len(bp.node_names())} nodes."
         except (ValidationError, ValueError, yaml.YAMLError) as e:
-            return f"ERROR: {e}"
+            return _count_failure(holder, f"ERROR: {e}")
 
     def submit(args: dict) -> str:
         result = validate(args)
@@ -132,29 +147,32 @@ def _structured_tools(holder: Dict) -> List[ToolSpec]:
 def build_ingestion_agent(llm: BaseLLM, source_type: str = "excel", verbose: bool = True) -> ToolAgent:
     """Source-specific ingestion agent: legacy artefact -> validated YAML blueprint."""
     profile = _SOURCE_PROFILES[source_type]
-    holder: Dict = {}
+    cfg = skills_settings()
+    holder: Dict = {"max_corrections": cfg["max_corrections"] if cfg["enabled"] else None}
     tools = [ToolSpec(n, d, f) for n, d, f in profile["tools"]] + _structured_tools(holder)
-    system = (
-        f"You are the {source_type.upper()} Ingestion Agent. Convert the input into a pipeline "
-        f"blueprint. {profile['hint']} {RICH_SPEC if profile.get('rich') else BLUEPRINT_SPEC} "
-        "Always call validate_yaml before "
-        "submit_final and fix every error it reports."
-    )
+    role_spec = (f"Convert the input into a pipeline blueprint. {profile['hint']} "
+                 f"{RICH_SPEC if profile.get('rich') else BLUEPRINT_SPEC} "
+                 "Always call validate_yaml before submit_final and fix every error it reports.")
+    skill_prompt = (compose_prompt(source_type, role_spec, [t.name for t in tools], cfg["max_corrections"])
+                    if cfg["enabled"] else None)
+    system = skill_prompt or f"You are the {source_type.upper()} Ingestion Agent. {role_spec}"
     agent = ToolAgent(f"Ingestion:{source_type}", llm, system, ToolRegistry(tools), verbose=verbose)
+    agent.skill_prompt_used = skill_prompt is not None
     holder["agent"] = agent
     return agent
 
 
 def build_hive_to_spark_agent(llm: BaseLLM, verbose: bool = True) -> ToolAgent:
     """Hive QL -> Spark SQL translation agent (validated before reaching the YAML stage)."""
-    holder: Dict = {}
+    cfg = skills_settings()
+    holder: Dict = {"max_corrections": cfg["max_corrections"] if cfg["enabled"] else None}
 
     def check(args: dict) -> str:
         try:
             ValidationEngine.validate_sql(args["content"], "spark")
             return "OK: valid Spark SQL."
         except ValueError as e:
-            return f"ERROR: {e}"
+            return _count_failure(holder, f"ERROR: {e}")
 
     def submit(args: dict) -> str:
         r = check(args)
@@ -162,17 +180,20 @@ def build_hive_to_spark_agent(llm: BaseLLM, verbose: bool = True) -> ToolAgent:
             holder["agent"].final = strip_fences(args["content"])
         return r
 
-    system = (
-        "You are the Hive QL -> Spark SQL Agent. Translate Hive QL to Spark 3 SQL: replace "
-        "Hive-only syntax (e.g. hivevar/hiveconf substitution, TRANSFORM scripts, deprecated "
-        "functions, MAPJOIN hints -> BROADCAST), keep semantics identical, keep statements "
-        "separated by semicolons. Always call check_sql before submit_final and fix errors."
-    )
+    role_spec = (
+        "Translate Hive QL to Spark 3 SQL: replace Hive-only syntax (e.g. hivevar/hiveconf substitution, TRANSFORM "
+        "scripts, deprecated functions, MAPJOIN hints -> BROADCAST), keep semantics identical, keep statements "
+        "separated by semicolons. Always call check_sql before submit_final and fix errors.")
     tools = [
         ToolSpec("check_sql", "Validate Spark SQL syntax.", check),
         ToolSpec("submit_final", "Submit final Spark SQL. Only accepted if valid.", submit),
     ]
+    skill_prompt = (compose_prompt("hiveql", role_spec, [t.name for t in tools], cfg["max_corrections"], deliverable="sql")
+                    if cfg["enabled"] else None)
+    system = skill_prompt or f"You are the Hive QL -> Spark SQL Agent. {role_spec}"
     agent = ToolAgent("HiveToSpark", llm, system, ToolRegistry(tools), verbose=verbose)
+    agent.auto_submit = True
+    agent.skill_prompt_used = skill_prompt is not None
     holder["agent"] = agent
     return agent
 
@@ -227,6 +248,7 @@ def build_pyspark_agent(llm: BaseLLM, blueprint: PipelineBlueprint, verbose: boo
     ]
     agent = ToolAgent("PySparkGen", llm, system, ToolRegistry(tools), verbose=verbose,
                       max_turns=16 if rc_tools else 10)
+    agent.auto_submit = True
     holder["agent"] = agent
     return agent
 
@@ -283,6 +305,8 @@ def build_airflow_agent(llm: BaseLLM, blueprint: PipelineBlueprint, verbose: boo
         ToolSpec("submit_final", "Submit the final DAG file. Only accepted if valid.", submit),
     ]
     agent = ToolAgent("AirflowGen", llm, system, ToolRegistry(tools), verbose=verbose)
+    agent.auto_submit = True
     holder["agent"] = agent
     return agent
+
 

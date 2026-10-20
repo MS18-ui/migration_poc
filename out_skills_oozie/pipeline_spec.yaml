@@ -1,0 +1,177 @@
+name: daily_sales
+source_system: oozie
+target_engine: pyspark_3.x
+global_configs:
+  source_workflow: workflow.xml
+  source_hash: UNKNOWN_NOT_SUPPLIED
+  metadata_snapshot: UNKNOWN_NOT_SUPPLIED
+steps:
+- step_id: 1
+  name: import_orders
+  type: source
+  action: sqoop_import
+  path: /raw/orders
+  depends_on: []
+  details: {}
+  params:
+    connect: jdbc:mysql://db/sales
+    table: orders
+    target_dir: /raw/orders
+    auth: UNKNOWN_NOT_SUPPLIED
+    write_mode: UNKNOWN_NOT_SUPPLIED
+- step_id: 2
+  name: clean_orders
+  type: transformation
+  action: spark_job_reference
+  path: clean_orders.py
+  depends_on:
+  - import_orders
+  details: {}
+  params:
+    spark_app_name: clean
+    jar: clean_orders.py
+    analysis_status: opaque_external_script_not_parsed
+findings:
+- id: F-001
+  category: unsupported_logic
+  severity: high
+  confidence: high
+  source_ref: 'workflow.xml: action clean_orders (<spark> jar clean_orders.py)'
+  evidence: Transformation is delegated to an external PySpark script whose content
+    was not supplied; its logic cannot be interpreted or mapped.
+  affected_refs:
+  - clean_orders
+  blocks:
+  - analysis
+  - generation
+  - execution
+  status: open
+  resolution: Supply clean_orders.py for separate analysis as its own Spark job, or
+    provide a reviewed mapping; treat as a referenced job dependency.
+  rule_ref: null
+- id: F-002
+  category: metadata
+  severity: high
+  confidence: high
+  source_ref: 'workflow.xml: action import_orders (<sqoop> command)'
+  evidence: Source table 'orders' referenced without schema, column, partition, or
+    key metadata; no metadata snapshot supplied.
+  affected_refs:
+  - import_orders
+  blocks:
+  - generation
+  - execution
+  status: open
+  resolution: Provide metadata snapshot for mysql sales.orders and destination mapping
+    for /raw/orders before target generation.
+  rule_ref: null
+- id: F-003
+  category: security
+  severity: medium
+  confidence: medium
+  source_ref: 'workflow.xml: action import_orders (<sqoop> command)'
+  evidence: Sqoop command contains no authentication argument; the authentication
+    method and credential source are unknown. No literal credential is present in
+    the supplied source.
+  affected_refs:
+  - import_orders
+  blocks:
+  - execution
+  status: open
+  resolution: Define the approved credential reference mechanism for the target (no
+    literals in YAML) and confirm the connection source.
+  rule_ref: null
+- id: F-004
+  category: operational
+  severity: medium
+  confidence: medium
+  source_ref: 'workflow.xml: action import_orders (--target-dir /raw/orders)'
+  evidence: Import writes to a fixed HDFS directory; overwrite, append, or delete
+    semantics are not specified (no --delete-target-dir or --append). Write scope
+    is unknown.
+  affected_refs:
+  - import_orders
+  blocks:
+  - execution
+  status: open
+  resolution: Decide and document bounded write semantics for /raw/orders and its
+    Iceberg destination before execution.
+  rule_ref: null
+- id: F-005
+  category: privacy
+  severity: medium
+  confidence: low
+  source_ref: 'workflow.xml: action import_orders (--table orders)'
+  evidence: Table name suggests order-level records that may include customer or financial
+    attributes; classification is provisional without metadata.
+  affected_refs:
+  - import_orders
+  - clean_orders
+  blocks:
+  - execution
+  status: open
+  resolution: Provide metadata classification and an applicable handling policy for
+    the orders dataset; no real records were inspected.
+  rule_ref: null
+- id: F-006
+  category: business_assumption
+  severity: medium
+  confidence: high
+  source_ref: 'workflow.xml: action clean_orders <ok>/<error> transitions and kill
+    node ''fail'''
+  evidence: Any failure in either action routes to a kill node with message 'Job failed';
+    no retry, cleanup, alerting, or partial-state handling is defined. Input to clean_orders
+    from /raw/orders is implicit (not declared).
+  affected_refs:
+  - import_orders
+  - clean_orders
+  - fail
+  blocks:
+  - execution
+  status: open
+  resolution: Confirm intended failure semantics (retries, alerting, cleanup of partial
+    /raw/orders output) and declare the data handoff between the two steps.
+  rule_ref: null
+- id: F-007
+  category: configuration
+  severity: high
+  confidence: high
+  source_ref: 'workflow.xml: no coordinator document supplied'
+  evidence: No coordinator schedule, start time, or timezone supplied; schedule is
+    unknown and omitted from the blueprint.
+  affected_refs:
+  - daily_sales
+  blocks:
+  - execution
+  status: open
+  resolution: Supply the coordinator definition or the approved schedule and timezone.
+  rule_ref: null
+- id: F-008
+  category: compatibility
+  severity: medium
+  confidence: high
+  source_ref: 'run context: source/target versions and conversion schema'
+  evidence: No source/target version declaration, source hashes, executable oozie-to-pyspark
+    conversion schema, or capability registry was supplied; this blueprint is a proposed
+    draft and the framework computes validation.
+  affected_refs:
+  - daily_sales
+  blocks:
+  - execution
+  status: open
+  resolution: Provide declared versions, source hashes, and an installed conversion
+    schema/capability registry; then re-run analysis.
+  rule_ref: null
+provenance:
+  source:
+    path: samples\workflow.xml
+    sha256: f2d7deece0488af3b4938d27da0378703b4270664bc70b64aa483face48bf117
+    type: oozie
+  skills:
+    migration-analysis/SKILL.md: 3a609f44fbb268bf
+    oozie-to-airflow/SKILL.md: ca5bbcc201f3633d
+    migration-analysis/references/security-privacy.md: 35f31b28010853ff
+    migration-analysis/references/output-contract.md: c6e077d092b0c796
+  model: claude-haiku-5-5
+  local_secret_screening:
+    values_masked: 0

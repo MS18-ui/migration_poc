@@ -1,0 +1,739 @@
+name: pyspark2_daily_txn_risk
+source_system: pyspark2
+target_engine: pyspark_3.x
+findings:
+- id: F-001
+  category: business_assumption
+  severity: high
+  confidence: high
+  source_ref: 'T5 amount_usd: F.coalesce(F.col(''usd_rate''), F.lit(1.0))'
+  evidence: A missing FX rate for a currency and date is silently treated as rate
+    1.0 (USD parity). Preserved as written; not validated.
+  affected_refs:
+  - t05_amounts
+  - tgt_customer_daily_risk
+  blocks:
+  - execution
+  status: open
+  resolution: Business owner to declare FX fallback policy (preserve, NULL, or reject)
+    and required FX coverage. No silent change.
+  rule_ref: null
+- id: F-002
+  category: compatibility
+  severity: high
+  confidence: high
+  source_ref: 'T3: txn.filter(status == POSTED).dropDuplicates([''txn_id''])'
+  evidence: Keeps one arbitrary row per txn_id with no ordering or tie-breaker. Conflicting
+    duplicates (including equal txn_ts) produce a non-deterministic winner.
+  affected_refs:
+  - t03_posted_txn
+  blocks:
+  - generation
+  - execution
+  status: open
+  resolution: Define a deterministic ordering (for example, a declared version or
+    load column with a unique final tie-breaker) before deduplication, or reviewer-approved
+    rule. Do not select arbitrarily.
+  rule_ref: null
+- id: F-003
+  category: metadata
+  severity: high
+  confidence: high
+  source_ref: 'Sources: spark.table(curated.transactions, accounts, customers, ref.high_risk_countries);
+    spark.read.parquet(hdfs:///data/ref/fx_rates/)'
+  evidence: No metadata snapshot supplied. Column types, partition specs, and nested
+    field types beyond the source comments are unknown; source schema lists are empty.
+  affected_refs:
+  - src_transactions
+  - src_accounts
+  - src_customers
+  - src_fx
+  - src_hrc
+  blocks:
+  - generation
+  - execution
+  status: open
+  resolution: Supply a metadata snapshot with column types, partition columns, and
+    key information for each source and the target, then regenerate schema blocks.
+  rule_ref: null
+- id: F-004
+  category: compatibility
+  severity: high
+  confidence: medium
+  source_ref: 'T4 joins: account_id, customer_id, currency = fx_currency, cp_country
+    = hr_country'
+  evidence: Uniqueness of accounts.account_id, customers.customer_id, fx (currency,
+    rate_date) and high_risk_countries.country is not verified. Non-unique keys would
+    multiply transaction rows.
+  affected_refs:
+  - t04_enriched_join
+  blocks:
+  - execution
+  status: open
+  resolution: Verify key uniqueness against metadata or declare keys with an owner.
+    Add a duplicate-key check to the validation plan.
+  rule_ref: null
+- id: F-005
+  category: business_assumption
+  severity: medium
+  confidence: high
+  source_ref: 'T4: inner joins to accounts and customers'
+  evidence: Transactions without a matching account or customer are silently dropped.
+    The source does not distinguish an absent account or customer from a data-quality
+    issue.
+  affected_refs:
+  - t04_enriched_join
+  blocks:
+  - execution
+  status: open
+  resolution: Confirm inner-join drop behavior is intended and document drop counts
+    as a reconciliation control.
+  rule_ref: null
+- id: F-006
+  category: business_assumption
+  severity: medium
+  confidence: medium
+  source_ref: 'T1: element_at(filter(addresses, a -> a.is_primary), 1)'
+  evidence: Zero primary addresses yield NULL residence_country. Multiple primaries
+    take the first element in array order, which is not specified. Absent addresses
+    yield NULL address_countries and multi_country_flag behavior that depends on null
+    size semantics.
+  affected_refs:
+  - t01_cust_profile
+  - t14_customer_base
+  blocks:
+  - execution
+  status: open
+  resolution: Define primary-address tie rule and null-address handling. Distinguish
+    absent address from missing customer in the output contract.
+  rule_ref: null
+- id: F-007
+  category: privacy
+  severity: high
+  confidence: medium
+  source_ref: 'Sources: curated.transactions (counterparty), curated.accounts (attributes),
+    curated.customers (addresses); target risk.customer_daily_risk'
+  evidence: Customer, account, and counterparty attributes plus AML flags and exposure
+    data are processed and written. Classification is metadata-based and provisional;
+    no handling policy was supplied.
+  affected_refs:
+  - src_transactions
+  - src_accounts
+  - src_customers
+  - tgt_customer_daily_risk
+  blocks:
+  - execution
+  status: open
+  resolution: Provide an applicable data handling policy naming permitted destinations,
+    access controls, logging restrictions, and required transformations. No masking
+    has been applied.
+  rule_ref: null
+- id: F-008
+  category: operational
+  severity: high
+  confidence: medium
+  source_ref: 'TARGET: write.mode(''overwrite'').insertInto(''risk.customer_daily_risk'')
+    with spark.sql.sources.partitionOverwriteMode=dynamic'
+  evidence: Partition columns are not declared, so the overwrite scope is unknown.
+    If no POSTED transactions exist for run_date, the outcome for existing partitions
+    is undefined in this analysis. Dynamic mode replaces only partitions present in
+    the output.
+  affected_refs:
+  - tgt_customer_daily_risk
+  blocks:
+  - execution
+  status: open
+  resolution: Declare target partition spec and the exact overwrite scope. Define
+    empty-input behavior for run_date. No overwrite is permitted until bounded.
+  rule_ref: null
+- id: F-009
+  category: compatibility
+  severity: medium
+  confidence: medium
+  source_ref: 'T6: orderBy(txn_ts.cast(''long'')).rangeBetween(-3*86400, 0)'
+  evidence: Frame is inclusive of the current row. RANGE includes all peers with the
+    same ordering value. Casting timestamp to seconds truncates sub-second ordering,
+    which can change which rows fall in the window.
+  affected_refs:
+  - t07_structuring_window
+  blocks:
+  - execution
+  status: open
+  resolution: Confirm the seconds-truncated ordering is intended. Verify the RANGE
+    and cast behavior against version-matched Spark 3 documentation.
+  rule_ref: null
+- id: F-010
+  category: compatibility
+  severity: medium
+  confidence: high
+  source_ref: 'T9: F.map_from_entries(F.collect_list(F.struct(''currency'',''usd'')))'
+  evidence: A NULL currency produces a NULL map key, which fails at runtime. The source
+    has no handling for NULL currency.
+  affected_refs:
+  - t12_exposure_pairs
+  - t13_exposure
+  blocks:
+  - execution
+  status: open
+  resolution: Declare NULL-currency policy (reject, bucket, or exclude) and add a
+    null-key check.
+  rule_ref: null
+- id: F-011
+  category: compatibility
+  severity: medium
+  confidence: medium
+  source_ref: 'T5: F.round(amount * coalesce(usd_rate, 1.0), 2).cast(''double'')'
+  evidence: Amount type is unknown. ROUND then CAST to DOUBLE drops DECIMAL intent.
+    Thresholds 10000 and 8000 to 9999.99 are applied to double values, which may change
+    boundary results for values near thresholds.
+  affected_refs:
+  - t05_amounts
+  - t06_near_threshold
+  blocks:
+  - execution
+  status: open
+  resolution: Declare the source DECIMAL precision and target type. Preserve exact
+    decimal arithmetic or get reviewer approval for double semantics.
+  rule_ref: null
+- id: F-012
+  category: business_assumption
+  severity: low
+  confidence: high
+  source_ref: 'summary: CASE WHEN size(risk_reasons) = 0 THEN 10'
+  evidence: Customers with no fired rules receive risk_score 10 through a hard-coded
+    default.
+  affected_refs:
+  - t15_summary
+  blocks:
+  - execution
+  status: open
+  resolution: Business owner to confirm the default score.
+  rule_ref: null
+- id: F-013
+  category: compatibility
+  severity: low
+  confidence: medium
+  source_ref: T1 size(address_countries); T5 and T9 boolean expressions
+  evidence: NULL handling for size() and boolean expressions depends on Spark 3 legacy
+    settings. Not verified against version-matched documentation in this run.
+  affected_refs:
+  - t01_cust_profile
+  - t05_amounts
+  - t09_rules
+  blocks:
+  - execution
+  status: open
+  resolution: Verify NULL semantics for the target Spark 3 version and record the
+    result.
+  rule_ref: null
+- id: F-014
+  category: unsupported_logic
+  severity: high
+  confidence: high
+  source_ref: T1, T7, T8, T9, T10 F.expr higher-order functions (filter, transform,
+    array_max) and explode_aggregate, window, and collect constructs
+  evidence: No executable pyspark2_to_spark3 schema or capability registry was supplied.
+    Support for these constructs is not verified. The scanner returned no findings,
+    which is not evidence that the job is safe.
+  affected_refs:
+  - t01_cust_profile
+  - t07_structuring_window
+  - t09_rules
+  - t10_rule_hits
+  - t15_summary
+  blocks:
+  - generation
+  - execution
+  status: open
+  resolution: Install the conversion schema and capability registry with explicit
+    handlers for these constructs. Re-run analysis.
+  rule_ref: null
+- id: F-015
+  category: configuration
+  severity: high
+  confidence: high
+  source_ref: 'TARGET: insertInto(''risk.customer_daily_risk'') on Hive; enableHiveSupport'
+  evidence: Target Iceberg mapping, format, and table properties are not supplied.
+    Source uses positional insertInto.
+  affected_refs:
+  - tgt_customer_daily_risk
+  blocks:
+  - execution
+  status: open
+  resolution: Provide the Iceberg target mapping, format, and column order. Verify
+    against target schema.
+  rule_ref: null
+- id: F-016
+  category: configuration
+  severity: low
+  confidence: high
+  source_ref: run_date = '2026-10-18'; hdfs:///data/ref/fx_rates/
+  evidence: run_date is hard-coded and the FX path is a literal in source. Parameterized
+    here as :run_date with a default.
+  affected_refs:
+  - job
+  - src_fx
+  blocks:
+  - execution
+  status: open
+  resolution: Confirm run_date is supplied by the scheduler and confirm the FX path
+    per environment.
+  rule_ref: null
+- id: F-017
+  category: privacy
+  severity: low
+  confidence: medium
+  source_ref: Source counterparty STRUCT fields account_no and name
+  evidence: counterparty account_no and name are read but not used in outputs. cp_name
+    and cp_bic are derived but not written. Data minimization candidate.
+  affected_refs:
+  - t03_posted_txn
+  blocks: []
+  status: open
+  resolution: Confirm no downstream use. Consider excluding unused fields from the
+    read projection.
+  rule_ref: null
+- id: F-018
+  category: operational
+  severity: medium
+  confidence: medium
+  source_ref: T8 collect_list and T10 collect_set; T9 collect_list
+  evidence: Unbounded collect per customer may produce large arrays and memory pressure
+    for high-activity customers.
+  affected_refs:
+  - t11_reasons
+  - t13_exposure
+  - t14_customer_base
+  blocks:
+  - execution
+  status: open
+  resolution: Measure collection sizes on representative data. Define a bound or accept
+    the operational risk.
+  rule_ref: null
+- id: F-019
+  category: operational
+  severity: low
+  confidence: low
+  source_ref: 'T4: F.broadcast(fx), F.broadcast(hrc)'
+  evidence: Broadcast hints are applied without size evidence. Table sizes are unknown.
+  affected_refs:
+  - t04_enriched_join
+  blocks: []
+  status: open
+  resolution: Confirm reference-table sizes fit broadcast thresholds.
+  rule_ref: null
+provenance:
+  source:
+    path: Claude_op\daily_txn_risk_job.py
+    sha256: 7543364cd30b3c625178d4fe1f4098f64d8e5efef8a541e3f251aa526d56e261
+    type: pyspark2
+  skills:
+    migration-analysis/SKILL.md: 3a609f44fbb268bf
+    pyspark2-to-spark3/SKILL.md: eaa258a21a60653c
+    migration-analysis/references/security-privacy.md: 35f31b28010853ff
+    migration-analysis/references/output-contract.md: c6e077d092b0c796
+  model: claude-haiku-5-5
+  local_secret_screening:
+    values_masked: 0
+job:
+  name: pyspark2_daily_txn_risk
+  domain: banking_aml
+  use_case: Daily customer transaction risk and AML flags with nested types
+  engine: pyspark
+  engine_version: 2.4 source; target pyspark_3.x
+  source_file: 'UNVERIFIED: path and hash not supplied in this run'
+  parameters:
+    run_date: '2026-10-18'
+  spark_conf:
+    spark.sql.sources.partitionOverwriteMode: dynamic
+sources:
+- id: src_transactions
+  type: hive_table
+  object: curated.transactions
+  pre_filter: txn_date = :run_date
+  schema: []
+- id: src_accounts
+  type: hive_table
+  object: curated.accounts
+  schema: []
+- id: src_customers
+  type: hive_table
+  object: curated.customers
+  schema: []
+- id: src_fx
+  type: parquet
+  path: hdfs:///data/ref/fx_rates/
+  pre_filter: rate_date = :run_date
+  schema: []
+- id: src_hrc
+  type: hive_table
+  object: ref.high_risk_countries
+  schema: []
+transformations:
+- id: t01_cust_profile
+  type: nested_derive
+  inputs:
+  - src_customers
+  columns:
+  - name: primary_address
+    expr: element_at(filter(addresses, a -> a.is_primary), 1)
+  - name: residence_country
+    expr: primary_address.country
+  - name: address_countries
+    expr: array_distinct(transform(addresses, a -> a.country))
+  - name: multi_country_flag
+    expr: size(address_countries) > 1
+  select:
+  - customer_id
+  - segment
+  - residence_country
+  - address_countries
+  - multi_country_flag
+  notes: Source T1. Zero primary addresses yield NULL residence_country; multiple
+    primaries take the first in array order (unspecified). Absent addresses are distinct
+    from a missing customer. size() on NULL addresses depends on Spark 3 legacy sizeOfNull
+    setting; verify against version-matched docs.
+- id: t02_acct_attrs
+  type: nested_derive
+  inputs:
+  - src_accounts
+  columns:
+  - name: product_code
+    expr: attributes['product_code']
+  - name: overdraft_limit
+    expr: CAST(attributes['overdraft_limit'] AS DOUBLE)
+  - name: is_joint
+    expr: attributes['joint_holder'] = 'Y'
+  select:
+  - account_id
+  - customer_id
+  - product_code
+  - overdraft_limit
+  - is_joint
+  notes: Source T2. Missing map key returns NULL; invalid overdraft string cast to
+    NULL silently. is_joint is NULL when key absent.
+- id: t03_posted_txn
+  type: filter_dedupe_flatten
+  inputs:
+  - src_transactions
+  columns:
+  - name: cp_name
+    expr: counterparty.name
+  - name: cp_bic
+    expr: counterparty.bank_bic
+  - name: cp_country
+    expr: counterparty.country
+  filter: status = 'POSTED'
+  dedupe_keys:
+  - txn_id
+  notes: Source T3. dropDuplicates(txn_id) keeps an arbitrary row; a deterministic
+    tie-breaker is required before execution (see F-002). counterparty.account_no
+    is read by the schema but not used by the source; not carried forward (see F-017).
+- id: t04_enriched_join
+  type: join
+  inputs:
+  - t03_posted_txn
+  - t02_acct_attrs
+  - t01_cust_profile
+  - src_fx
+  - src_hrc
+  joins:
+  - left: t03_posted_txn
+    right: t02_acct_attrs
+    type: inner
+    'on':
+    - account_id
+  - left: '*'
+    right: t01_cust_profile
+    type: inner
+    'on':
+    - customer_id
+  - left: '*'
+    right: src_fx
+    type: left
+    'on': currency = fx_currency
+    hint: broadcast
+  - left: '*'
+    right: src_hrc
+    type: left
+    'on': cp_country = hr_country
+    hint: broadcast
+  notes: Source T4. Inner joins drop transactions lacking a matching account or customer.
+    FX and high-risk joins are left joins; key uniqueness is unverified (see F-004).
+- id: t05_amounts
+  type: nested_derive
+  inputs:
+  - t04_enriched_join
+  columns:
+  - name: amount_usd
+    expr: CAST(ROUND(amount * COALESCE(usd_rate, 1.0), 2) AS DOUBLE)
+  - name: is_large_txn
+    expr: amount_usd >= 10000
+  - name: is_cash
+    expr: txn_type IN ('CASH_DEP', 'CASH_WDL')
+  - name: is_high_risk_cp
+    expr: hr_country IS NOT NULL
+  - name: is_cross_border
+    expr: cp_country IS NOT NULL AND cp_country <> residence_country
+  notes: Source T5. Missing FX falls back to rate 1.0 (business assumption, see F-001).
+    ROUND then CAST to DOUBLE drops DECIMAL intent (see F-011). Threshold 10000 is
+    inclusive.
+- id: t06_near_threshold
+  type: nested_derive
+  inputs:
+  - t05_amounts
+  columns:
+  - name: near_threshold
+    expr: CASE WHEN is_cash AND amount_usd BETWEEN 8000 AND 9999.99 THEN 1 ELSE 0
+      END
+  notes: Source T6 flag. BETWEEN is inclusive at both bounds 8000 and 9999.99. NULL
+    is_cash or amount yields 0.
+- id: t07_structuring_window
+  type: window
+  inputs:
+  - t06_near_threshold
+  columns:
+  - name: near_thr_cnt_3d
+    expr: SUM(near_threshold)
+  window:
+    partition_by:
+    - customer_id
+    order_by:
+    - CAST(txn_ts AS BIGINT)
+    frame: RANGE BETWEEN 259200 PRECEDING AND CURRENT ROW
+  notes: Source T6 window. Frame is 3*86400 seconds inclusive of the current row;
+    RANGE includes all peers with equal ordering value. Timestamp cast to seconds
+    truncates sub-second ordering (see F-009).
+- id: t08_structuring_flag
+  type: nested_derive
+  inputs:
+  - t07_structuring_window
+  columns:
+  - name: structuring_flag
+    expr: near_thr_cnt_3d >= 3
+- id: t09_rules
+  type: nested_derive
+  inputs:
+  - t08_structuring_flag
+  columns:
+  - name: fired_raw
+    expr: array(CASE WHEN structuring_flag THEN named_struct('rule_id', 'R01', 'description',
+      'Cash structuring', 'score', 90) END, CASE WHEN is_high_risk_cp THEN named_struct('rule_id',
+      'R02', 'description', 'High-risk counterparty country', 'score', 70) END, CASE
+      WHEN is_large_txn THEN named_struct('rule_id', 'R03', 'description', 'Large
+      transaction >= 10k USD', 'score', 40) END, CASE WHEN is_cross_border AND multi_country_flag
+      THEN named_struct('rule_id', 'R04', 'description', 'Cross-border with multi-country
+      profile', 'score', 30) END)
+  - name: fired_rules
+    expr: filter(fired_raw, r -> r IS NOT NULL)
+  notes: Source T7. Rule scores 90, 70, 40, 30 preserved. NULL conditions do not fire.
+    This transformation is the scored dataset used by T10 to T14.
+- id: t10_rule_hits
+  type: explode_aggregate
+  inputs:
+  - t09_rules
+  group_by:
+  - customer_id
+  - r.rule_id AS rule_id
+  aggregations:
+  - name: hit_count
+    expr: COUNT(txn_id)
+  - name: total_amount_usd
+    expr: SUM(amount_usd)
+  - name: max_score
+    expr: MAX(r.score)
+  notes: 'Source T8. Explode is non-outer: transactions with no fired rules drop out
+    here (intended per source; preserved). Group key rule_id is projected from the
+    exploded struct.'
+  explode:
+    column: fired_rules
+    alias: r
+- id: t11_reasons
+  type: aggregate
+  inputs:
+  - t10_rule_hits
+  group_by:
+  - customer_id
+  aggregations:
+  - name: risk_reasons
+    expr: sort_array(collect_list(named_struct('rule_id', rule_id, 'hit_count', hit_count,
+      'total_amount_usd', total_amount_usd, 'max_score', max_score)))
+  notes: Source T8 collect. Output ARRAY<STRUCT<rule_id,hit_count,total_amount_usd,max_score>>
+    is sorted by struct order. collect_list is unbounded per customer (see F-018).
+- id: t12_exposure_pairs
+  type: aggregate
+  inputs:
+  - t09_rules
+  group_by:
+  - customer_id
+  - currency
+  aggregations:
+  - name: usd
+    expr: SUM(amount_usd)
+  notes: Source T9 first stage. NULL currency forms a NULL group (see F-010).
+- id: t13_exposure
+  type: aggregate
+  inputs:
+  - t12_exposure_pairs
+  group_by:
+  - customer_id
+  aggregations:
+  - name: exposure_by_currency
+    expr: map_from_entries(collect_list(named_struct('currency', currency, 'usd',
+      usd)))
+  notes: Source T9 second stage. map_from_entries fails at runtime on a NULL key (see
+    F-010). Output MAP<STRING,DOUBLE>.
+- id: t14_customer_base
+  type: aggregate
+  inputs:
+  - t09_rules
+  group_by:
+  - customer_id
+  - segment
+  - residence_country
+  aggregations:
+  - name: address_countries
+    expr: FIRST(address_countries)
+  - name: multi_country_flag
+    expr: FIRST(multi_country_flag)
+  - name: txn_count
+    expr: COUNT(txn_id)
+  - name: total_amount_usd
+    expr: SUM(amount_usd)
+  - name: large_txn_count
+    expr: SUM(CASE WHEN is_large_txn THEN 1 ELSE 0 END)
+  - name: structuring_flag
+    expr: MAX(structuring_flag)
+  - name: counterparty_countries
+    expr: COLLECT_SET(cp_country)
+  notes: Source T10. FIRST without ignoreNulls preserved. address_countries and multi_country_flag
+    are constant per customer by construction.
+- id: t15_summary
+  type: join_derive
+  inputs:
+  - t14_customer_base
+  - t11_reasons
+  - t13_exposure
+  columns:
+  - name: risk_reasons
+    expr: COALESCE(risk_reasons, CAST(array() AS ARRAY<STRUCT<rule_id:STRING,hit_count:BIGINT,total_amount_usd:DOUBLE,max_score:INT>>))
+  - name: risk_score
+    expr: CASE WHEN size(risk_reasons) = 0 THEN 10 ELSE array_max(transform(risk_reasons,
+      r -> r.max_score)) END
+  - name: run_date
+    expr: :run_date
+  joins:
+  - left: t14_customer_base
+    right: t11_reasons
+    type: left
+    'on':
+    - customer_id
+  - left: '*'
+    right: t13_exposure
+    type: left
+    'on':
+    - customer_id
+  notes: 'Source summary. Customers with no fired rules get an empty reasons array
+    and risk_score 10 (business assumption, see F-012). Columns evaluated in order:
+    risk_reasons is coalesced before risk_score reads it.'
+targets:
+- id: tgt_customer_daily_risk
+  input: t15_summary
+  type: iceberg_table
+  object: risk.customer_daily_risk
+  format: UNRESOLVED
+  mode: overwrite_dynamic_partition
+  method: insertInto
+  partition_by: []
+  schema: []
+  properties: {}
+  notes: Source writes Hive table risk.customer_daily_risk with insertInto and overwrite
+    mode under dynamic partition overwrite. Iceberg mapping, partition spec, and write
+    scope are unresolved (see F-008, F-015). insertInto is positional; target column
+    order must match the source select list. Target schema not supplied.
+lineage:
+- target_column: customer_id
+  from:
+  - curated.customers.customer_id
+  via:
+  - t01_cust_profile
+- target_column: residence_country
+  from:
+  - curated.customers.addresses
+  via:
+  - t01_cust_profile
+- target_column: address_countries
+  from:
+  - curated.customers.addresses
+  via:
+  - t01_cust_profile
+- target_column: multi_country_flag
+  from:
+  - curated.customers.addresses
+  via:
+  - t01_cust_profile
+  - t14_customer_base
+- target_column: txn_count
+  from:
+  - curated.transactions.txn_id
+  via:
+  - t03_posted_txn
+  - t14_customer_base
+- target_column: total_amount_usd
+  from:
+  - curated.transactions.amount
+  - hdfs:///data/ref/fx_rates/.usd_rate
+  via:
+  - t04_enriched_join
+  - t05_amounts
+  - t14_customer_base
+- target_column: large_txn_count
+  from:
+  - curated.transactions.amount
+  via:
+  - t05_amounts
+  - t14_customer_base
+- target_column: structuring_flag
+  from:
+  - curated.transactions.txn_ts
+  - curated.transactions.txn_type
+  - curated.transactions.amount
+  via:
+  - t06_near_threshold
+  - t07_structuring_window
+  - t08_structuring_flag
+  - t14_customer_base
+- target_column: counterparty_countries
+  from:
+  - curated.transactions.counterparty
+  via:
+  - t03_posted_txn
+  - t14_customer_base
+- target_column: exposure_by_currency
+  from:
+  - curated.transactions.currency
+  - curated.transactions.amount
+  via:
+  - t12_exposure_pairs
+  - t13_exposure
+  - t15_summary
+- target_column: risk_reasons
+  from:
+  - curated.transactions.counterparty
+  - curated.transactions.amount
+  via:
+  - t09_rules
+  - t10_rule_hits
+  - t11_reasons
+  - t15_summary
+- target_column: risk_score
+  from:
+  - derived:fired_rules
+  via:
+  - t09_rules
+  - t15_summary
+- target_column: run_date
+  from:
+  - job.parameters.run_date
+  via:
+  - t15_summary

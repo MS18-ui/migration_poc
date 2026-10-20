@@ -4,6 +4,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 SourceSystem = Literal["oozie", "pyspark2", "sqoop", "hiveql", "excel"]
 
+FINDING_CATEGORIES = ("compatibility", "unsupported_logic", "metadata", "configuration", "security", "privacy",
+                      "operational", "business_assumption")
+FINDING_SEVERITIES = ("info", "low", "medium", "high", "critical")
+FINDING_CONFIDENCE = ("low", "medium", "high")
+FINDING_BLOCKS = ("analysis", "generation", "execution")
 SOURCE_TYPES = ("hive_table", "parquet", "orc", "csv", "json", "avro", "jdbc", "iceberg_table", "delta", "kafka")
 TARGET_TYPES = ("hive_table", "iceberg_table", "parquet", "orc", "csv", "jdbc", "delta")
 TRANSFORM_TYPES = (
@@ -130,6 +135,12 @@ class PipelineBlueprint(BaseModel):
     schedule: Optional[str] = None  # cron or Airflow preset, e.g. "0 2 * * *" / "@daily"
     global_configs: dict = Field(default_factory=dict)
     steps: List[PipelineStep] = Field(default_factory=list)
+
+    # Analysis findings (see FINDING_* below and skills/migration-analysis/references/output-contract.md).
+    # Written by the analysis agent; review decisions are made by identified humans, never by the agent.
+    findings: List[Dict[str, Any]] = Field(default_factory=list)
+    # Traceability: source hash, skill file hashes, model used (set by the framework, not by the agent)
+    provenance: Dict[str, Any] = Field(default_factory=dict)
 
     job: Optional[JobInfo] = None
     sources: List[Source] = Field(default_factory=list)

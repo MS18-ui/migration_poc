@@ -3,7 +3,7 @@ import re
 
 import yaml
 
-from .blueprint_checks import check_rich_blueprint
+from .blueprint_checks import check_findings, check_rich_blueprint
 from .schemas import PipelineBlueprint
 
 
@@ -42,6 +42,9 @@ class ValidationEngine:
     def validate_logical_dag(blueprint: PipelineBlueprint) -> None:
         if not blueprint.steps and not blueprint.is_rich:
             raise ValueError("Pipeline has no steps (or sources/transformations/targets).")
+        problems = check_findings(blueprint)
+        if problems:
+            raise ValueError("Invalid findings:\n- " + "\n- ".join(problems[:15]))
         if blueprint.is_rich:
             check_rich_blueprint(blueprint)
         seen, ids = set(), set()

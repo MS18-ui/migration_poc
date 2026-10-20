@@ -4,6 +4,7 @@ from typing import Iterable, List
 
 from .schemas import (SOURCE_TYPES, TARGET_TYPES, TRANSFORM_TYPES, PipelineBlueprint,
                       SchemaField)
+from .secrets import redact_secrets
 
 _FILE_TYPES = {"parquet", "orc", "csv", "json", "avro", "delta"}
 _PARAM_RE = re.compile(r"(?<![\w:]):([A-Za-z_]\w*)")
@@ -79,6 +80,45 @@ def _check_expr_syntax(owner: str, expr: str, errors: List[str]) -> None:
         sqlglot.parse_one(probe, read="spark")
     except Exception as e:  # sqlglot ParseError / TokenError
         errors.append(f"{owner}: expression does not parse as Spark SQL: {expr!r} ({str(e).splitlines()[0]})")
+
+
+def check_findings(bp: PipelineBlueprint) -> List[str]:
+    """Problems with the agent-written `findings` list (empty list = fine). Applies to flat and rich blueprints."""
+    from .schemas import FINDING_BLOCKS, FINDING_CATEGORIES, FINDING_CONFIDENCE, FINDING_SEVERITIES
+    errors: List[str] = []
+    seen = set()
+    for i, f in enumerate(bp.findings):
+        where = f"findings[{i}]"
+        if not isinstance(f, dict):
+            errors.append(f"{where}: must be a mapping")
+            continue
+        fid = f.get("id")
+        if not fid or not isinstance(fid, str):
+            errors.append(f"{where}: needs a string 'id'")
+        elif fid in seen:
+            errors.append(f"{where}: duplicate id '{fid}'")
+        seen.add(fid)
+        where = f"finding '{fid or i}'"
+        if f.get("category") not in FINDING_CATEGORIES:
+            errors.append(f"{where}: category must be one of {list(FINDING_CATEGORIES)}, got {f.get('category')!r}")
+        if f.get("severity") not in FINDING_SEVERITIES:
+            errors.append(f"{where}: severity must be one of {list(FINDING_SEVERITIES)}, got {f.get('severity')!r}")
+        if f.get("confidence") is not None and f["confidence"] not in FINDING_CONFIDENCE:
+            errors.append(f"{where}: confidence must be one of {list(FINDING_CONFIDENCE)}")
+        blocks = f.get("blocks")
+        if not isinstance(blocks, list) or any(b not in FINDING_BLOCKS for b in blocks):
+            errors.append(f"{where}: 'blocks' must be a list drawn from {list(FINDING_BLOCKS)} (use [] if it blocks nothing)")
+        if f.get("status", "open") != "open":
+            errors.append(f"{where}: status must be 'open' - resolving or accepting a risk is a decision for an identified "
+                          "human reviewer, not for the analysis agent")
+        text = str(f.get("evidence") or f.get("summary") or "")
+        if not text.strip():
+            errors.append(f"{where}: needs 'evidence' or 'summary' text")
+        elif redact_secrets(text)[1] or redact_secrets(str(f.get("resolution", "")))[1]:
+            errors.append(f"{where}: contains a credential-looking value; findings must never echo secrets (use rule id + location)")
+        if f.get("severity") in ("high", "critical") and not f.get("source_ref"):
+            errors.append(f"{where}: high/critical findings need a 'source_ref' (file and line/statement)")
+    return errors
 
 
 def check_rich_blueprint(bp: PipelineBlueprint) -> None:

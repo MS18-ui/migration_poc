@@ -1,4 +1,4 @@
-"""Rule-based compatibility, security and unsupported-construct detection (PLAN.md section 4 / 6).
+﻿"""Rule-based compatibility, security and unsupported-construct detection (PLAN.md section 4 / 6).
 
 Source is parsed, never executed. Each rule yields a Finding with a source location; static analysis is
 reported as evidence for review, never as proof that a workload is safe or equivalent."""
@@ -6,6 +6,7 @@ import ast
 import re
 from typing import List, Tuple
 
+from ..secrets import line_has_secret, redact_secrets  # noqa: F401  (redact_secrets re-exported)
 from .findings import Finding
 
 _UNSUPPORTED = {
@@ -22,26 +23,7 @@ _UNSAFE_ATTRS = {"system", "popen", "check_output", "check_call", "loads", "load
 _DATE_FUNCS = {"to_date", "to_timestamp", "unix_timestamp", "from_unixtime", "date_format"}
 _DEPRECATED = {"registertemptable": "registerTempTable is deprecated (use createOrReplaceTempView)",
                "unionall": "unionAll is deprecated (use union)"}
-# \w* on both sides so compound names (DB_PASSWORD, client_secret_value, aws_access_key_id) are caught
-_SECRET_RE = re.compile(r"(?i)\w*(?:pass(?:word|wd|phrase)|secret|token|api[_-]?key|access[_-]?key|private[_-]?key)\w*"
-                        r"\s*[=:]\s*['\"][^'\"]{3,}['\"]")
-_JDBC_CRED_RE = re.compile(r"(?i)jdbc:[a-z]+://[^'\"\s]*(?:password|pwd)=[^&'\"\s]+|://\w+:[^@/'\"\s]+@")
 _MONEY_RE = re.compile(r"(?i)amount|price|balance|total|cost|fee|salary")
-
-
-def redact_secrets(text: str) -> Tuple[str, int]:
-    """Local scan before ANY model submission (PLAN.md section 4): mask credential-looking values."""
-    n = 0
-    def mask(m):
-        nonlocal n
-        n += 1
-        return re.sub(r"""(['"])[^'"]{3,}\1""", '"<REDACTED>"', m.group(0))
-    text = _SECRET_RE.sub(mask, text)
-    def mask_url(m):
-        nonlocal n
-        n += 1
-        return re.sub(r"((?:password|pwd)=)[^&'\"\s]+", r"\1<REDACTED>", re.sub(r"(://\w+:)[^@/'\"\s]+@", r"\1<REDACTED>@", m.group(0)), flags=re.I)
-    return _JDBC_CRED_RE.sub(mask_url, text), n
 
 
 def _name(n: ast.Call) -> str:
@@ -69,7 +51,7 @@ def scan_python(source: str, path: str) -> List[Finding]:
         f.append(Finding(cat, sev, msg, source_location=loc(node), confidence=conf, resolution=res, impact=impact))
 
     for i, line in enumerate(source.splitlines(), 1):
-        if _SECRET_RE.search(line) or _JDBC_CRED_RE.search(line):
+        if line_has_secret(line):
             f.append(Finding("security", "error", "possible embedded secret / credential in source",
                              source_location=f"{path}:{i}", confidence="medium",
                              resolution="Replace with a secret reference; never copy it into YAML or logs."))
@@ -144,7 +126,7 @@ def scan_python(source: str, path: str) -> List[Finding]:
 def scan_sql_text(source: str, path: str) -> List[Finding]:
     f = []
     for i, line in enumerate(source.splitlines(), 1):
-        if _SECRET_RE.search(line):
+        if line_has_secret(line):
             f.append(Finding("security", "error", "possible embedded secret in SQL", source_location=f"{path}:{i}", confidence="medium"))
         if re.search(r"(?i)\b(drop\s+table|truncate\s+table|delete\s+from)\b", line):
             f.append(Finding("security", "warning", "destructive statement in source SQL", source_location=f"{path}:{i}", confidence="medium",
@@ -152,3 +134,4 @@ def scan_sql_text(source: str, path: str) -> List[Finding]:
         if re.search(r"(?i)\btransform\s*\(.*\busing\b", line) or re.search(r"(?i)\bADD\s+(JAR|FILE)\b", line):
             f.append(Finding("executability", "error", "Hive TRANSFORM / ADD JAR is not convertible", source_location=f"{path}:{i}"))
     return f
+

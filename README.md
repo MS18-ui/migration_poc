@@ -92,3 +92,36 @@ nothing but a temp directory. Without Spark the static layer still runs and the 
 
 Tests: `python -m unittest discover -s tests -v`. Offline tests need no Spark; the Spark-backed ones are skipped
 (not passed) where Spark/Java are missing.
+
+## Skills (Type Exchange analysis skills as ingestion-agent prompts)
+
+`agentic/skills/` holds the Type Exchange skills unchanged (one coordinator + one skill per conversion pair).
+`agentic/skills_loader.py` builds each ingestion agent's system prompt from them:
+
+| Source type | Skill used |
+|---|---|
+| oozie | oozie-to-airflow |
+| sqoop | sqoop-to-spark |
+| pyspark2 | pyspark2-to-spark3 |
+| hiveql | hiveql-to-spark-sql (also the Hive->Spark SQL agent, with an SQL deliverable) |
+| excel | none (built-in short prompt) |
+| hive-to-iceberg, yarn-to-ocp | no ingestion profile yet |
+
+The prompt is: coordinator skill + pair skill + security/privacy rules + findings contract, then an **Environment**
+section (written last, takes precedence) that says what this run can and cannot do (the skills assume file tools and a
+package writer; our agents have a parser tool and validate/submit only), then the blueprint format.
+Switch off with `skills.enabled: false` in `config.yaml`.
+
+What changes in a run:
+- **Findings.** The agent records what the skill says to report (unsupported logic, missing metadata/schema,
+  uniqueness and tie assumptions, privacy, write scope...) in the blueprint's `findings` list (checked by
+  `blueprint_checks.check_findings`: allowed categories/severities, `blocks`, source_ref for high/critical, no
+  credentials; status must be `open`, because only a human reviewer may resolve a finding or accept a risk).
+  The validator shows them next to its own findings.
+- **Local secret screening** (`agentic/secrets.py`) runs before any source reaches a model; a `F-REDACT` finding is
+  added if anything was masked.
+- **Bounded repair loop:** the first draft + `skills.max_corrections` (2) corrections, then the agent stops and the
+  unresolved problems are reported.
+- **Provenance** (written by the framework): source sha256, hashes of the skill files used, model, screening count.
+- **Metadata:** the skills expect a catalog metadata snapshot and do not invent schemas, so without one sources may come
+  back without schemas (reported as a finding) and the validator's Spark-backed layers cannot execute them.

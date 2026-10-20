@@ -43,8 +43,9 @@ class Session:
 
     def __init__(self, bp: PipelineBlueprint, source_text: str, source_path: str, lang: str = None,
                  seed: int = 1, n_random: int = 10, synth_budget: int = 60, params: dict = None,
-                 progress: Callable[[str], None] = None):
+                 progress: Callable[[str], None] = None, snapshot=None, aliases: dict = None):
         self.bp, self.source_text, self.source_path = bp, source_text, source_path
+        self.snapshot, self.aliases = snapshot, aliases or {}
         self.lang = lang or detect_lang(source_path, source_text)
         self.seed, self.n_random, self.synth_budget, self.params = seed, n_random, synth_budget, params
         self.say = progress or (lambda m: None)
@@ -59,9 +60,14 @@ class Session:
 
     # ---- layer 1 -----------------------------------------------------------------------
     def run_static(self) -> Report:
-        findings, matrix, self.engine = run_static(self.bp, self.source_text, self.source_path, self.lang)
+        findings, matrix, self.engine = run_static(self.bp, self.source_text, self.source_path, self.lang,
+                                                   snapshot=self.snapshot, aliases=self.aliases)
         self.report.extend(findings)
         self.report.coverage_matrix = matrix
+        held = [f for f in self.bp.findings if isinstance(f, dict) and "execution" in (f.get("blocks") or [])]
+        if self.bp.findings:
+            self.report.stats["analysis_findings"] = len(self.bp.findings)
+            self.report.stats["analysis_findings_blocking_execution"] = len(held)
         self.static_done = True
         return self.report
 
@@ -333,4 +339,5 @@ def write_outputs(s: Session, out_dir: str) -> None:
         f.write(s.report.to_markdown())
     with open(os.path.join(out_dir, "test_suite.json"), "w", encoding="utf-8") as f:
         json.dump(s.suite.to_dict(), f, indent=1, default=str)
+
 
