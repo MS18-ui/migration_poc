@@ -263,7 +263,11 @@ def _runcheck_tools(blueprint: PipelineBlueprint, holder: Dict, verbose: bool) -
         if verbose:
             print(f"   [PySparkGen] run-and-diff validation skipped: {why}")
         return []
-    return make_runcheck_tools(blueprint, cfg, holder)
+    tools = make_runcheck_tools(blueprint, cfg, holder)
+    if verbose:
+        for note in holder.get("runcheck_notes", []):
+            print(f"   [PySparkGen] {note}")
+    return tools
 
 
 # backwards-compatible alias

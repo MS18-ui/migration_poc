@@ -10,6 +10,7 @@ from .agents import (build_airflow_agent, build_hive_to_spark_agent,
 from .llm import BaseLLM
 from .schemas import PipelineBlueprint
 from .metadata import Snapshot, apply_snapshot
+from .outputs import out_name, stamp_now, unique_stamp
 from .secrets import redact_secrets
 from .skills_loader import skill_provenance
 from .validation import ValidationEngine
@@ -47,6 +48,8 @@ class AgenticFramework:
         self.input_path, self.llm, self.out_dir = input_path, llm, out_dir
         self.source_type = source_type
         self.snapshot, self.aliases = snapshot, aliases or {}   # catalog metadata (optional)
+        self.stamp = stamp_now()    # run start time; names every output file of this run
+        self.output_files: list = []
         self.raw_input = ""
         self.model_text = ""        # what the models see: raw_input after local secret screening
         self.redactions = 0
@@ -160,16 +163,20 @@ class AgenticFramework:
     def export_production_artifacts(self):
         print("[5/5 Export] Writing outputs...")
         os.makedirs(self.out_dir, exist_ok=True)
+        stamp = unique_stamp(self.out_dir, self.stamp)  # one folder, `<name>_<date>_<time>`; never overwrites a prior run
+        spark_name = out_name("generated_pipeline", stamp, "py")
         files = {
-            "pipeline_spec.yaml": yaml.dump(self.blueprint.to_dict(), sort_keys=False),
-            "generated_pipeline.py": self.pyspark_code + "\n",
-            "airflow_dag.py": self.airflow_code + "\n",
+            out_name("pipeline_spec", stamp, "yaml"): yaml.dump(self.blueprint.to_dict(), sort_keys=False),
+            spark_name: self.pyspark_code + "\n",
+            # the DAG is told to submit `generated_pipeline.py`; point it at the file actually written
+            out_name("airflow_dag", stamp, "py"): self.airflow_code.replace("generated_pipeline.py", spark_name) + "\n",
         }
         if self.spark_sql:
-            files["converted_spark.sql"] = self.spark_sql + "\n"
+            files[out_name("converted_spark", stamp, "sql")] = self.spark_sql + "\n"
         for name, content in files.items():
             with open(os.path.join(self.out_dir, name), "w", encoding="utf-8") as f:
                 f.write(content)
+        self.output_files = [os.path.join(self.out_dir, n) for n in files]
         print(f">> Wrote {', '.join(files)} to {self.out_dir}/")
 
     def run(self):

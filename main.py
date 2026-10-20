@@ -17,7 +17,8 @@ if __name__ == "__main__":
                         "(default: metadata.snapshot in config.yaml; pass no value to run without one)")
     p.add_argument("--metadata-alias", action="append", default=[], metavar="JOB_NAME=CATALOG_NAME",
                    help="explicit table alias, used only when the job's name differs from the catalog's (repeatable)")
-    p.add_argument("--out", default="output")
+    p.add_argument("--out", default="output",
+                   help="output folder for all files (default: output); names are <name>_<YYYYMMDD>_<HHMMSS>.<ext>")
     a = p.parse_args()
 
     cfg = metadata_settings()

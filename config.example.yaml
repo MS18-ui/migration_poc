@@ -1,0 +1,89 @@
+﻿# LLM settings. Environment variables of the same purpose override these values
+# (LLM_PROVIDER, AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_DEPLOYMENT, AZURE_OPENAI_API_KEY, ...).
+# Prefer setting the API key via AZURE_OPENAI_API_KEY rather than storing it here.
+provider: anthropic   # anthropic (Claude, incl. on Azure Foundry) | azure (Azure OpenAI)
+
+azure_openai:
+  endpoint: https://kratos-ai-resources.openai.azure.com/openai/v1
+  project_endpoint: https://kratos-ai-resources.services.ai.azure.com/api/projects/kratos-ai-resources-project  # informational; not used by this framework
+  deployment: ""        # your model deployment name (required)
+  api_key: ""  # set AZURE_OPENAI_API_KEY in the environment; never commit a key
+  api_version: "2024-10-21"
+  max_tokens: 16000
+
+anthropic:
+  # Claude on Azure AI Foundry. The SDK appends /v1/messages to base_url.
+  # Leave base_url empty to call api.anthropic.com directly.
+  base_url: https://kratos-ai-resources.services.ai.azure.com/anthropic
+  model: claude-haiku-5-5   # your Foundry Claude *deployment name* (e.g. claude-sonnet-5-5)
+  api_key: ""           # empty -> ANTHROPIC_API_KEY env, then azure_openai.api_key (same resource)
+  max_tokens: 16000
+
+# Run-and-diff validation of generated PySpark (needs pyspark + Java; skipped with a notice if absent).
+# Runs the script on synthetic data generated from the blueprint's source schemas in local Spark.
+validation:
+  enabled: true
+  mode: local                   # local = synthetic data in local Spark | cluster = real tables, sandboxed writes
+  # Cluster mode: candidate READS the real tables named in baseline_table_map; ALL writes (candidate and
+  # baseline) are redirected into a throwaway database `<scratch_db_prefix><time>_<pid>_<run>` that is
+  # dropped afterwards. Anything that would write elsewhere is blocked. Best-effort guard: ALSO use a
+  # Hive/Ranger user with read-only rights on the real databases.
+  cluster:
+    master: spark://spark-master:7077      # as in Claude_op/spark_session.py (hostname resolves on the cluster host)
+    scratch_db_prefix: runcheck_tmp_       # the only namespace a run may create, write to or drop
+    keep_scratch: false                    # true = keep the scratch DB to inspect outputs
+    params: {}                             # override job parameters, e.g. {run_date: "2026-10-18"} (a date that has data)
+    # Hive Metastore + HDFS settings, copied from Claude_op/spark_session.py. 172.16.0.4 is what that
+    # code uses; your service list shows 172.171.240.8 - use whichever address is reachable from where
+    # you run this (run it ON the cluster host and either should work).
+    spark_conf:
+      spark.sql.catalogImplementation: hive
+      hive.metastore.uris: thrift://172.16.0.4:9083
+      spark.sql.hive.metastore.version: "4.1.0"
+      spark.sql.hive.metastore.jars: maven
+      spark.hadoop.fs.defaultFS: hdfs://172.16.0.4:9000
+      spark.sql.warehouse.dir: hdfs://172.16.0.4:9000/user/hive/warehouse
+      spark.sql.adaptive.enabled: "true"
+  require_pass: true            # PySpark agent cannot submit_final until run/diff passes
+  rows: 2000                    # rows per generated source table
+  seed: 7
+  timeout_seconds: 600
+  # data_script: path/to/my_data.py      # optional: def generate(blueprint, params) -> {source_id: {"ddl","rows"}}
+  # diff_keys: [customer_id]             # default: first column of each target schema
+  # Trusted script whose output the generated code must reproduce (leave empty for run-only checks):
+  baseline_script: Claude_op/daily_txn_risk_job_spark3.py
+  # Maps blueprint table/path -> the table the baseline script reads/writes:
+  baseline_table_map:
+    curated.transactions: aahhd01q_pnc_poc.transactions
+    curated.accounts: aahhd01q_pnc_poc.accounts
+    curated.customers: aahhd01q_pnc_poc.customers
+    ref.high_risk_countries: aahhd01q_pnc_poc.high_risk_countries
+    hdfs:///data/ref/fx_rates/: aahhd01q_pnc_poc.fx_rates
+    risk.customer_daily_risk: aahhd01q_pnc_poc.customer_daily_risk
+
+# Validation agent (python -m agentic.validator). It executes the blueprint's operations on small synthetic
+# tables in a REAL Spark session, so run it where Spark + Java exist (e.g. the cluster host).
+# It reads no Hive tables and writes nothing outside a temp directory, so no metastore settings are needed.
+validator:
+  spark:
+    master: local[2]            # driver-only Spark on this host (fast for thousands of tiny runs).
+                                # Use spark://spark-master:7077 to run on the cluster (slower per run; the
+                                # driver's temp dir must then be readable by the executors).
+    conf: {}                    # extra Spark settings, e.g. spark.sql.ansi.enabled: "true" to test ANSI semantics
+
+# Type Exchange skills (agentic/skills) used as the ingestion agents' system prompts.
+skills:
+  enabled: true                 # false = the short built-in prompts (no skill text, no findings guidance)
+  max_corrections: 2            # validation failures allowed after the first draft; then stop and keep blockers
+
+# Catalog metadata snapshot: authoritative physical schemas (columns, types, partitions, locations) for the tables
+# the job reads/writes. A file, or a folder of Hive DDL (.hql/.sql) and/or canonical YAML/JSON. Override per run
+# with `main.py --metadata PATH`. Inspect/export one with:  python -m agentic.metadata <path> [--out snapshot.yaml]
+metadata:
+  snapshot: Claude_op           # leave empty to run without catalog metadata (sources may then come back without schemas)
+  # Explicit job-name -> catalog-name mapping, used ONLY when a name differs. The framework never guesses a match
+  # (e.g. it will not treat curated.transactions as aahhd01q_pnc_poc.transactions). An identical name always wins.
+  # This is unrelated to validation.baseline_table_map, which names the baseline script's tables.
+  aliases: {}
+
+

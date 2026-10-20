@@ -1,14 +1,20 @@
-"""Loads config.yaml (path override: AGENTIC_CONFIG). Env vars take precedence over file values."""
+"""Loads config.yaml (path override: AGENTIC_CONFIG). Env vars take precedence over file values.
+
+config.yaml is local and git-ignored (it can hold keys). The repo tracks `config.example.yaml` with every setting and no
+secrets; when there is no config.yaml, that example is used, so a fresh clone works. To customise:
+copy config.example.yaml to config.yaml and edit it."""
 import os
 from typing import Any, Dict
 
 import yaml
 
-_DEFAULT_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml")
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_DEFAULT_PATH = os.path.join(_ROOT, "config.yaml")
+_EXAMPLE_PATH = os.path.join(_ROOT, "config.example.yaml")
 
 
 def load_config() -> Dict[str, Any]:
-    path = os.getenv("AGENTIC_CONFIG", _DEFAULT_PATH)
+    path = os.getenv("AGENTIC_CONFIG") or (_DEFAULT_PATH if os.path.exists(_DEFAULT_PATH) else _EXAMPLE_PATH)
     if not os.path.exists(path):
         return {}
     with open(path, encoding="utf-8") as f:

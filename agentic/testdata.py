@@ -188,6 +188,9 @@ def generate(bp: PipelineBlueprint, params: Dict[str, Any] = None, n_rows: int =
     out: Dict[str, Dict[str, Any]] = {}
     used_keys = _map_keys_used(bp)
     for s in bp.sources:
+        if not s.schema_:  # no declared / catalog schema: there is nothing to generate rows from
+            out[s.id] = {"ddl": "", "rows": [], "skipped": "source has no schema"}
+            continue
         cols: List[Tuple[str, str, Any, List[str]]] = []  # name, ddl type, parsed, known_keys
         for f in s.schema_:
             ts = field_type_str(f)

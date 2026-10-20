@@ -1,6 +1,6 @@
 ﻿from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 SourceSystem = Literal["oozie", "pyspark2", "sqoop", "hiveql", "excel"]
 
@@ -84,6 +84,16 @@ class Transformation(BaseModel):
     aggregations: Optional[List[Dict[str, Any]]] = None  # {name, expr}
     sql: Optional[str] = None                            # spark_sql / custom escape hatch
     notes: Optional[str] = None                          # migration notes / caveats
+
+    @field_validator("notes", mode="before")
+    @classmethod
+    def _notes_as_text(cls, v):
+        """Models often write notes as a list; keep the content instead of failing validation."""
+        if isinstance(v, list):
+            return "; ".join(str(x) for x in v)
+        if isinstance(v, dict):
+            return "; ".join(f"{k}: {x}" for k, x in v.items())
+        return v
 
 
 class Target(BaseModel):

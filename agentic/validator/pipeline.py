@@ -7,6 +7,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from ..outputs import out_name, stamp_now, unique_stamp
 from ..schemas import PipelineBlueprint, Transformation
 from ..testdata import generate
 from .coverage import python_facts, sql_facts
@@ -43,13 +44,16 @@ class Session:
 
     def __init__(self, bp: PipelineBlueprint, source_text: str, source_path: str, lang: str = None,
                  seed: int = 1, n_random: int = 10, synth_budget: int = 60, params: dict = None,
-                 progress: Callable[[str], None] = None, snapshot=None, aliases: dict = None):
+                 progress: Callable[[str], None] = None, snapshot=None, aliases: dict = None, report_meta: dict = None):
         self.bp, self.source_text, self.source_path = bp, source_text, source_path
+        self.written: List[str] = []   # files write_outputs produced
         self.snapshot, self.aliases = snapshot, aliases or {}
         self.lang = lang or detect_lang(source_path, source_text)
         self.seed, self.n_random, self.synth_budget, self.params = seed, n_random, synth_budget, params
         self.say = progress or (lambda m: None)
         self.report = Report(job=bp.name or "job")
+        if report_meta:  # e.g. which spec/source files this report is about
+            self.report.stats.update(report_meta)
         self.suite = Suite()
         self.engine: Optional[Engine] = None
         self.scenarios: Dict[str, List[Scenario]] = {}
@@ -326,18 +330,26 @@ def run_validation(bp: PipelineBlueprint, source_text: str, source_path: str, ou
     s.run_tests()
     s.finish_stats()
     if out_dir:
-        write_outputs(s, out_dir)
+        s.written = write_outputs(s, out_dir)
     return s.report, s.suite, s
 
 
-def write_outputs(s: Session, out_dir: str) -> None:
+def write_outputs(s: Session, out_dir: str, stamp: Optional[str] = None) -> List[str]:
+    """Write the report (.json, .md) and the test suite into `out_dir` as `<name>_<YYYYMMDD>_<HHMMSS>.<ext>`
+    (same folder as the pipeline outputs; never overwrites). Returns the paths written."""
     os.makedirs(out_dir, exist_ok=True)
     s.finish_stats()
-    with open(os.path.join(out_dir, "validation_report.json"), "w", encoding="utf-8") as f:
+    stamp = unique_stamp(out_dir, stamp or stamp_now())
+    paths = [os.path.join(out_dir, out_name("validation_report", stamp, "json")),
+             os.path.join(out_dir, out_name("validation_report", stamp, "md")),
+             os.path.join(out_dir, out_name("test_suite", stamp, "json"))]
+    with open(paths[0], "w", encoding="utf-8") as f:
         f.write(s.report.to_json())
-    with open(os.path.join(out_dir, "validation_report.md"), "w", encoding="utf-8") as f:
+    with open(paths[1], "w", encoding="utf-8") as f:
         f.write(s.report.to_markdown())
-    with open(os.path.join(out_dir, "test_suite.json"), "w", encoding="utf-8") as f:
+    with open(paths[2], "w", encoding="utf-8") as f:
         json.dump(s.suite.to_dict(), f, indent=1, default=str)
+    s.written = paths
+    return paths
 
 

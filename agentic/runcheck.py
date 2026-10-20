@@ -149,6 +149,8 @@ class RunCheck:
         tables, files = [], []
         for s in self.bp.sources:
             d = self.data[s.id]
+            if not d["ddl"]:  # schema-less source: no table can be created for it
+                continue
             if s.object:
                 tables.append({"name": table_map.get(s.object, s.object), "ddl": d["ddl"],
                                "data_dir": self._data_dirs[s.id]})
@@ -259,10 +261,39 @@ class RunCheck:
         return "OK: output matches baseline (" + "; ".join(summary) + ")."
 
 
+def runcheck_applicability(bp: PipelineBlueprint, settings: Dict[str, Any]) -> Dict[str, Any]:
+    """Can run-and-diff work for THIS blueprint? -> {"enabled", "baseline", "notes"}.
+
+    * local mode needs a schema for every source (test data is generated from it); without one the run-check is
+      skipped, otherwise the agent would be gated on a check that can never pass
+    * the baseline script is specific to one job: it is only used when this blueprint's tables appear in
+      validation.baseline_table_map
+    """
+    notes: List[str] = []
+    missing = [s.id for s in bp.sources if not s.schema_]
+    if settings.get("mode", "local") == "local" and missing:
+        return {"enabled": False, "baseline": False,
+                "notes": [f"run-and-diff skipped: source(s) {missing} have no schema (no catalog match), so test data cannot be "
+                          "generated. Supply a catalog snapshot that contains them."]}
+    baseline = bool(settings.get("baseline_script"))
+    if baseline:
+        keys = {s.object or s.path for s in bp.sources} | {t.object for t in bp.targets if t.object}
+        if not (keys & set(settings.get("baseline_table_map") or {})):
+            baseline = False
+            notes.append("baseline diff skipped: validation.baseline_script is configured for a different job (none of this "
+                         "blueprint's tables appear in validation.baseline_table_map).")
+    return {"enabled": True, "baseline": baseline, "notes": notes}
+
+
 def make_runcheck_tools(bp: PipelineBlueprint, settings: Dict[str, Any], holder: Dict[str, Any],
                         runner: Callable = None) -> List[ToolSpec]:
     """Tools for the PySpark agent. `holder['verified']` records the hash of the last code that
-    passed (so submit_final can require it)."""
+    passed (so submit_final can require it). Returns [] (with `holder['runcheck_notes']` saying why) when
+    run-and-diff cannot work for this blueprint."""
+    app = runcheck_applicability(bp, settings)
+    holder["runcheck_notes"] = app["notes"]
+    if not app["enabled"]:
+        return []
     rc = RunCheck(bp, settings, runner)
     holder["runcheck"] = rc
 
@@ -275,7 +306,7 @@ def make_runcheck_tools(bp: PipelineBlueprint, settings: Dict[str, Any], holder:
                       "Execute the script on generated test data in local Spark; reports runtime errors "
                       "(with traceback) or target row counts.",
                       lambda a: stamp(a["content"], rc.run_tool(a["content"])))]
-    if settings.get("baseline_script"):
+    if app["baseline"]:
         tools.append(ToolSpec(
             "diff_vs_baseline",
             "Run the script and the trusted baseline on the SAME test data and diff the target tables "

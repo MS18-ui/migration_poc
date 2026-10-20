@@ -1,1 +1,11 @@
 config.yaml 
+__pycache__/
+*.pyc
+output/
+out_*/
+output_*/
+validation_out/
+val_*/
+.env
+*.log
+.ipynb_checkpoints/

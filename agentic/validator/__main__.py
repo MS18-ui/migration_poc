@@ -3,6 +3,7 @@
 Exit status: 0 = PASSED, 1 = FAILED (error findings), 2 = could not run, 3 = INCOMPLETE (a layer did not run,
 e.g. no Spark on this host: static checks only). Run it where Spark + Java exist for the full result."""
 import argparse
+import os
 import sys
 
 from ..validation import ValidationEngine
@@ -13,7 +14,9 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="agentic.validator", description="Validate that a blueprint YAML captures all source logic")
     ap.add_argument("--spec", required=True, help="blueprint YAML (rich format)")
     ap.add_argument("--source", required=True, help="legacy source (.py PySpark or .hql/.sql)")
-    ap.add_argument("--out", default="validation_out")
+    ap.add_argument("--out", default="output",
+                    help="output folder (default: output, shared with the pipeline's outputs); files are named "
+                         "<name>_<YYYYMMDD>_<HHMMSS>.<ext>")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--n-random", type=int, default=10, help="random multi-row scenarios per node")
     ap.add_argument("--synth-budget", type=int, default=60, help="synthesis attempts per node with surviving mutants")
@@ -40,19 +43,20 @@ def main(argv=None) -> int:
     mpaths = [mpaths] if isinstance(mpaths, str) else [x for x in (mpaths or []) if x]
     snapshot = load_snapshot(*mpaths) if mpaths else None
     say = (lambda m: None) if a.quiet else (lambda m: print("  ..", m))
+    meta = {"spec_file": os.path.basename(a.spec), "source_file": os.path.basename(a.source)}  # what this report is about
     if a.agent == "none":
         report, suite, sess = run_validation(bp, src, a.source, a.out, progress=say, seed=a.seed,
                                              n_random=a.n_random, synth_budget=a.synth_budget,
-                                             snapshot=snapshot, aliases=mcfg["aliases"])
+                                             snapshot=snapshot, aliases=mcfg["aliases"], report_meta=meta)
     else:
         from .agent import run_review_agent
         sess = Session(bp, src, a.source, seed=a.seed, n_random=a.n_random, synth_budget=a.synth_budget, progress=say,
-                       snapshot=snapshot, aliases=mcfg["aliases"])
+                       snapshot=snapshot, aliases=mcfg["aliases"], report_meta=meta)
         run_review_agent(sess, offline=(a.agent == "offline"))
         write_outputs(sess, a.out)
         report = sess.report
     print(report.to_markdown())
-    print(f"\nOutputs written to {a.out}/ (validation_report.md, validation_report.json, test_suite.json)")
+    print("\nOutputs written to " + a.out + "/ : " + ", ".join(os.path.basename(p) for p in sess.written))
     return {"PASSED": 0, "FAILED": 1, "INCOMPLETE": 3}[report.result]
 
 
