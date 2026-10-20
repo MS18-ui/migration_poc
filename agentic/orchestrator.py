@@ -10,6 +10,7 @@ import yaml
 from . import events
 from .agents import (build_airflow_agent, build_hive_to_spark_agent,
                      build_ingestion_agent, build_pyspark_agent)
+from .humanize import dump_yaml
 from .llm import BaseLLM
 from .schemas import PipelineBlueprint
 from .metadata import Snapshot, apply_snapshot
@@ -49,7 +50,7 @@ STAGES = [("load", "Load and screen input"), ("hive", "Hive QL to Spark SQL"), (
 class AgenticFramework:
     """Router + pipeline:  input -> [Hive->Spark] -> Ingestion -> YAML -> PySpark + Airflow.
 
-    Every artifact is written into this run's folder (<out_dir>/run_<stamp>/) AS SOON AS IT EXISTS, and progress is
+    Every artifact is written into this run's folder (<out_dir>/<input file>_<date>_<time>/) AS SOON AS IT EXISTS, and progress is
     reported through `agentic.events`, so a UI can show the intermediate steps and files while the run is going."""
 
     def __init__(self, input_path: str, llm: BaseLLM, out_dir: str = "output",
@@ -61,7 +62,7 @@ class AgenticFramework:
         self.snapshot, self.aliases = snapshot, aliases or {}   # catalog metadata (optional)
         self.stamp = stamp_now()    # run start time; names every output file of this run
         self.output_files: list = []
-        self.run_dir = ""           # <out_dir>/run_<stamp>, created when the run starts
+        self.run_dir = ""           # <out_dir>/<input file>_<date>_<time>, created when the run starts
         self.status = "new"         # new | running | done | failed
         self.error: Optional[str] = None
         self.raw_input = ""
@@ -79,7 +80,7 @@ class AgenticFramework:
     def _start_run(self) -> None:
         if self.run_dir:
             return
-        self.run_dir, self.stamp = new_run_dir(self.out_dir, self.stamp)
+        self.run_dir, self.stamp = new_run_dir(self.out_dir, self.stamp, name=self.input_path)  # <input file>_<date>_<time>
         ev = events.current()
         if ev is not None:
             ev.set_path(os.path.join(self.run_dir, out_name("events", self.stamp, "jsonl")))
@@ -170,14 +171,24 @@ class AgenticFramework:
         self.blueprint.source_system = self.blueprint.source_system or self.source_type  # type: ignore
         self._record_provenance()
         if self.snapshot:
-            # show what the agent produced BEFORE the catalog is applied, then the catalog itself, then the result
-            self._write("Blueprint draft (before catalog metadata is applied)", "blueprint_agent", "yaml",
-                        yaml.dump(self.blueprint.to_dict(), sort_keys=False))
-            self._write("Catalog metadata snapshot used", "catalog_metadata", "yaml",
-                        yaml.dump(self.snapshot.to_dict(), sort_keys=False))
+            # show the draft BEFORE the catalog is applied, then the catalog tables that were used, then the result
+            self._write("Blueprint draft (before catalog metadata is applied)", "blueprint_agent", "yaml", self._spec_text())
             self._apply_metadata()
-        self._write("YAML blueprint (final)", "pipeline_spec", "yaml", yaml.dump(self.blueprint.to_dict(), sort_keys=False))
+            used = set(self.blueprint.provenance.get("metadata_snapshot", {}).get("tables") or [])
+            if used:
+                self._write("Catalog metadata used (only the tables this pipeline reads or writes)", "catalog_metadata", "yaml",
+                            dump_yaml(self.snapshot.to_dict(only=used)))
+        self._write("YAML blueprint (final)", "pipeline_spec", "yaml", self._spec_text())
+        # hashes, skill versions and the catalog application log are an audit record, not part of the readable specification
+        self._write("Traceability record (source hash, skill versions, catalog application)", "provenance", "yaml",
+                    dump_yaml(self.blueprint.provenance))
         print(">> Blueprint accepted.")
+
+    def _spec_text(self) -> str:
+        """The human-readable specification: clean values, logical key order, no audit data (see the provenance file)."""
+        d = self.blueprint.to_dict()
+        d.pop("provenance", None)
+        return dump_yaml(d)
 
     def _apply_metadata(self):
         """Deterministic: the catalog, not the model, decides physical schemas (fills, corrects, records findings)."""
@@ -209,13 +220,13 @@ class AgenticFramework:
             bp.findings.append({
                 "id": "F-REDACT", "category": "security", "severity": "medium", "confidence": "high",
                 "source_ref": self.input_label, "affected_refs": [], "blocks": ["execution"], "status": "open",
-                "evidence": f"{self.redactions} credential-looking value(s) were masked locally before the source was sent to "
-                            "the model; the YAML cannot carry them.",
+                "evidence": f"{self.redactions} credential-like value(s) in the source were masked before analysis, so the "
+                            "specification cannot carry them.",
                 "resolution": "Provide target credentials only as secret references in the deployment environment."})
 
     # 4 -------------------------------------------------------------------------------
     def run_generation_agents(self):
-        yaml_text = yaml.dump(self.blueprint.to_dict(), sort_keys=False)
+        yaml_text = self._spec_text()   # the readable specification (no audit data) is what the generators work from
         print("[4/5 Generate] PySpark 3.x agent working...")
         self.pyspark_code = build_pyspark_agent(self.llm, self.blueprint).run(
             f"YAML blueprint:\n{yaml_text}\n\nGenerate the PySpark script."
@@ -236,7 +247,7 @@ class AgenticFramework:
         print("[5/5 Export] Finalising outputs...")
         self._start_run()
         if self.blueprint is not None:
-            self._write("YAML blueprint (final)", "pipeline_spec", "yaml", yaml.dump(self.blueprint.to_dict(), sort_keys=False))
+            self._write("YAML blueprint (final)", "pipeline_spec", "yaml", self._spec_text())
         if self.pyspark_code:
             spark_path = self._write("Generated PySpark 3 script", "generated_pipeline", "py", self.pyspark_code + "\n")
             if self.airflow_code:

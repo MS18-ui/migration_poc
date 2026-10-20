@@ -131,14 +131,16 @@ class Snapshot:
                 "that is missing here as a metadata finding.\n" + "\n".join(lines))
 
     # ---- export ---------------------------------------------------------------------------
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self, only: Optional[set] = None) -> Dict[str, Any]:
+        """Canonical dictionary; `only` (a set of table names) restricts it to those tables."""
         return {"snapshot": {"id": self.id, "files": self.files},
                 "tables": {n: {k: v for k, v in {
                     "kind": t.kind, "format": t.format, "location": t.location, "external": t.external or None,
                     "partition_columns": t.partition_columns or None, "properties": t.properties or None,
                     "columns": [{k2: v2 for k2, v2 in {"name": c.name, "type": c.type, "partition": c.partition or None,
                                                        "comment": c.comment or None}.items() if v2 is not None}
-                                for c in t.columns]}.items() if v is not None} for n, t in sorted(self.tables.items())}}
+                                for c in t.columns]}.items() if v is not None}
+                           for n, t in sorted(self.tables.items()) if only is None or n in only}}
 
 
 # ---- loading -------------------------------------------------------------------------------
@@ -261,14 +263,53 @@ def load_snapshot(*paths: str) -> Snapshot:
 
 
 # ---- resolving a blueprint against the snapshot --------------------------------------------
+_TOKEN = re.compile(r"[A-Za-z_]\w*")
+
+
+def referenced_names(bp: PipelineBlueprint) -> set:
+    """Lower-case identifiers that appear anywhere in the pipeline logic (expressions, selects, keys, windows, rules, filters,
+    target columns). Used to keep a filled-in source schema to the columns the pipeline actually uses."""
+    out: set = set()
+
+    def walk(o: Any) -> None:
+        if isinstance(o, str):
+            out.update(m.lower() for m in _TOKEN.findall(o))
+        elif isinstance(o, dict):
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, (list, tuple)):
+            for v in o:
+                walk(v)
+
+    for t in bp.transformations:
+        walk(t.model_dump(by_alias=True, exclude_none=True))
+    for s in bp.sources:
+        walk(s.pre_filter)
+    for tg in bp.targets:
+        walk([f.name for f in tg.schema_])
+        walk(tg.partition_by)
+    return out
+
+
 def apply_snapshot(bp: PipelineBlueprint, snap: Snapshot, aliases: Optional[Dict[str, str]] = None,
                    source_ref: str = "") -> Dict[str, Any]:
     """Make the blueprint agree with the catalog (deterministically). Idempotent: running it again on its own
-    output changes nothing and adds no findings."""
+    output changes nothing and adds no findings.
+
+    A source whose schema is empty is filled with the catalog columns the pipeline USES (not every column of the table), so
+    the specification stays readable."""
     aliases = aliases or {}
     changes: List[str] = []
     matched: List[str] = []
     unmatched: List[str] = []
+    tables_used: set = set()
+    target_cols: set = set()   # a target that will be filled from the catalog needs all its columns, which may pass through sources
+    for tg in bp.targets:
+        if tg.object and not tg.schema_:
+            m, _c = snap.lookup(tg.object, aliases)
+            if m is not None:
+                target_cols |= {c.name.lower() for c in m.columns}
+    used_names = referenced_names(bp) | target_cols
     ids = {f.get("id") for f in bp.findings if isinstance(f, dict)}
     n = [0]
 
@@ -285,9 +326,10 @@ def apply_snapshot(bp: PipelineBlueprint, snap: Snapshot, aliases: Optional[Dict
                             "blocks": blocks, "status": "open", "resolution": resolution})
 
     def catalog_note(meta: TableMeta) -> Dict[str, Any]:
-        return {k: v for k, v in {"table": meta.name, "kind": meta.kind, "format": meta.format, "location": meta.location,
-                                  "external": meta.external or None, "partition_columns": meta.partition_columns or None,
-                                  "snapshot": snap.id}.items() if v is not None}
+        tables_used.add(meta.name)
+        return {k: v for k, v in {"table": meta.name, "kind": meta.kind if meta.kind != "table" else None,
+                                  "format": meta.format, "location": meta.location, "external": meta.external or None,
+                                  "partition_columns": meta.partition_columns or None}.items() if v is not None}
 
     for s in bp.sources:
         key = s.object or s.path
@@ -306,8 +348,9 @@ def apply_snapshot(bp: PipelineBlueprint, snap: Snapshot, aliases: Optional[Dict
             s.catalog = catalog_note(meta)
             continue
         if not s.schema_:
-            s.schema_ = [SchemaField(name=c.name, type=c.type) for c in meta.columns]
-            changes.append(f"{s.id}: schema filled from {meta.name} ({len(meta.columns)} columns)")
+            cols = [c for c in meta.columns if c.name.lower() in used_names] or list(meta.columns)
+            s.schema_ = [SchemaField(name=c.name, type=c.type) for c in cols]
+            changes.append(f"{s.id}: schema filled from {meta.name} ({len(cols)} of {len(meta.columns)} columns, those the pipeline uses)")
         else:
             for f in s.schema_:
                 c = meta.column(f.name)
@@ -374,7 +417,7 @@ def apply_snapshot(bp: PipelineBlueprint, snap: Snapshot, aliases: Optional[Dict
                 "Align the write with the table.")
 
     summary = {"id": snap.id, "files": snap.files, "tables_in_snapshot": len(snap.tables), "matched": matched,
-               "unmatched": unmatched, "changes": changes[:60], "warnings": snap.warnings[:10]}
+               "unmatched": unmatched, "tables": sorted(tables_used), "changes": changes[:60], "warnings": snap.warnings[:10]}
     bp.provenance["metadata_snapshot"] = summary
     return summary
 

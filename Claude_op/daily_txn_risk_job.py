@@ -10,15 +10,15 @@ run_date = "2026-10-18"
 
 # ---------- SOURCES ----------
 # txn.counterparty : STRUCT<name, bank_bic, account_no, country>
-txn = spark.table("curated.transactions").filter(F.col("txn_date") == run_date)
+txn = spark.table("aahhd01q_pnc_poc.transactions").filter(F.col("txn_date") == run_date)
 # accounts.attributes : MAP<STRING,STRING>
-accounts = spark.table("curated.accounts")
+accounts = spark.table("aahhd01q_pnc_poc.accounts")
 # customers.addresses : ARRAY<STRUCT<type, line1, city, country, is_primary>>
-customers = spark.table("curated.customers")
-fx = (spark.read.parquet("hdfs:///data/ref/fx_rates/")
+customers = spark.table("aahhd01q_pnc_poc.customers")
+fx = (spark.read.parquet("hdfs://172.16.0.4:9000/user/hive/warehouse/aahhd01q_pnc_poc.db/fx_rates")
       .filter(F.col("rate_date") == run_date)
       .select(F.col("currency").alias("fx_currency"), "usd_rate"))
-hrc = (spark.table("ref.high_risk_countries")
+hrc = (spark.table("aahhd01q_pnc_poc.high_risk_countries")
        .select(F.col("country").alias("hr_country"), "risk_level"))
 
 # ---------- TRANSFORMATIONS ----------

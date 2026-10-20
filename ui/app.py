@@ -6,7 +6,7 @@ Sections
   Migration    Submit one or more legacy job files, uploaded or retrieved from a git repository, execute the migration, and
                review every stage, step and file as it is produced (stages, analysis steps, intermediate YAML, SQL and
                code, recorded findings). The resulting YAML blueprint can be validated.
-  Run History  Reopen any earlier run from output/run_<stamp>/ together with its step history and files.
+  Run History  Reopen any earlier run from output/<input file>_<date>_<time>/ together with its step history and files.
   Data Query   Read-only Hive and Trino queries with a schema browser. A single SELECT, WITH, VALUES, SHOW, DESCRIBE or
                EXPLAIN statement is accepted per execution; result sets are size-limited and queries are time-limited.
 
@@ -44,6 +44,7 @@ JOB_TEXT = {"queued": "Queued", "running": "In progress", "done": "Completed", "
 LANG = {".yaml": "yaml", ".yml": "yaml", ".py": "python", ".sql": "sql", ".hql": "sql", ".json": "json",
         ".jsonl": "json", ".xml": "xml", ".sh": "bash"}
 CATALOG_DEFAULT, CATALOG_UPLOAD, CATALOG_NONE = "Configured default", "Upload DDL / YAML", "None"
+TECH_PREFIXES = ("run_meta_", "events_", "provenance_")   # audit files: kept on disk, hidden in the file list by default
 
 st.set_page_config(page_title="Migration Workbench", layout="wide")
 
@@ -165,8 +166,10 @@ def render_run(run_dir: str, evs: List[Dict[str, Any]], status: str, label: str,
     with st.expander(f"Execution steps ({len(lines)})", expanded=status in ("running", "queued", "failed")):
         st.code("\n".join(lines[-400:]) or "No steps have been recorded yet.", language=None)
 
-    files = run_files(run_dir) if run_dir and os.path.isdir(run_dir) else []
+    all_files = run_files(run_dir) if run_dir and os.path.isdir(run_dir) else []
     labels = {e.get("name"): e.get("label") for e in evs if e.get("kind") == "file"}
+    show_tech = st.checkbox("Show technical files (run record, event log, traceability record)", key=f"tech_{key}")
+    files = all_files if show_tech else [f for f in all_files if not f["name"].startswith(TECH_PREFIXES)]
     st.markdown(f"**Files ({len(files)})**")
     if files:
         st.dataframe(pd.DataFrame([{"File": f["name"], "Description": labels.get(f["name"], ""), "Size": fmt_size(f["size"])}

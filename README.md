@@ -52,27 +52,35 @@ and edit it. Put keys in the environment (`AZURE_OPENAI_API_KEY`, `ANTHROPIC_API
 ### Outputs: one folder per run, inside `output/`
 
 A pipeline run writes ALL of its files into a single subfolder of the output folder (`output/` by default, `--out DIR` to
-change the base), named `run_<YYYYMMDD>_<HHMMSS>`. Files inside are named `<name>_<YYYYMMDD>_<HHMMSS>.<ext>`. A rerun gets
-its own folder, so nothing is overwritten (two runs in the same second get `_2`, `_3`...):
+change the base). The folder is named after the input file: `<input file name>_<YYYYMMDD>_<HHMMSS>`, for example
+`daily_txn_risk_job_20261020_153045`. Files inside are named `<name>_<YYYYMMDD>_<HHMMSS>.<ext>`. A rerun gets its own folder,
+so nothing is overwritten (two runs in the same second get `_2`, `_3`...).
 
 Files are written AS EACH STEP PRODUCES THEM (not only at the end), so a failed run still leaves what it got that far:
 
 ```
 output/
-  run_20261020_153045/
+  daily_txn_risk_job_20261020_153045/
     input_screened_<stamp>.<ext>        the input as submitted for analysis (credentials masked)
     converted_spark_<stamp>.sql         Hive QL -> Spark SQL                (Hive input only)
-    blueprint_agent_<stamp>.yaml        the agent's blueprint before the catalog is applied   (when a catalog is used)
-    catalog_metadata_<stamp>.yaml       the catalog snapshot used                             (when a catalog is used)
-    pipeline_spec_<stamp>.yaml          the final YAML blueprint (with findings and provenance)
+    blueprint_agent_<stamp>.yaml        the blueprint draft before the catalog is applied     (when a catalog is used)
+    catalog_metadata_<stamp>.yaml       the catalog tables this pipeline reads or writes      (when a catalog is used)
+    pipeline_spec_<stamp>.yaml          the final specification: sources, transformations, targets, findings
     generated_pipeline_<stamp>.py       airflow_dag_<stamp>.py
-    run_meta_<stamp>.json               status, input, model, timings, file list (lets the UI reopen the run)
-    events_<stamp>.jsonl                the step-by-step history                              (runs started from the UI)
+    provenance_<stamp>.yaml             audit record: source hash, skill versions, catalog application
+    run_meta_<stamp>.json               status, input, timings, file list (lets the UI reopen the run)
+    events_<stamp>.jsonl                the step-by-step history
     validation_report_<stamp>.json/.md  test_suite_<stamp>.json               (added by the validator)
 ```
 
+**`pipeline_spec` is written to be read by people.** It contains only what describes the pipeline: empty values are not written,
+keys follow a reading order (identifier and type first, notes last; findings: severity before evidence), long SQL
+expressions are kept on one line or in a literal block instead of being wrapped mid-expression, source schemas list only the
+columns the pipeline uses, and audit data (hashes, skill versions, the catalog application log) is kept in `provenance_<stamp>.yaml`
+instead. It still loads with `agentic.validation.load_yaml`, which reads `on` as a plain key.
+
 The validator adds its report to the run folder that holds the spec it checks (so one job's results stay together); for a
-spec that lives elsewhere it creates a new `output/run_<stamp>/`. The Airflow DAG submits the timestamped
+spec that lives elsewhere it creates a new folder named after the spec under `output/`. The Airflow DAG submits the timestamped
 `generated_pipeline_<stamp>.py` that was actually written, and a validation report records `spec_file` and `source_file`
 in its summary. `ANTHROPIC_MODEL` overrides the model.
 
@@ -94,7 +102,7 @@ on the page, and the interface does not expose provider or model settings.
   its outcome, each file at the moment it is created (input, blueprint draft, catalog metadata, final YAML, SQL, PySpark
   script, DAG), the findings recorded in the blueprint, a ZIP download, and a *Validate YAML Blueprint* action (the static
   checks always; the Spark-backed checks where Spark and Java are available).
-- **Run History**: reopens any earlier `output/run_*` folder with its step history, files and findings.
+- **Run History**: reopens any earlier run folder under `output/` with its step history, files and findings.
 - **Data Query (Hive / Trino)**: a connection form (defaults from the `query:` section of `config.yaml`; passwords are
   entered on the page or read from `HIVE_PASSWORD` / `TRINO_PASSWORD` and are never stored), a schema browser (databases or
   schemas, tables, table description, 100-row sample), an SQL editor with a row limit and time limit, and CSV download.
@@ -134,7 +142,7 @@ Add a source: add a profile in `agents.py::_SOURCE_PROFILES` and an extension in
 ## Validation agent (does the YAML capture all the source logic?)
 
 ```
-python -m agentic.validator --spec output/run_<stamp>/pipeline_spec_<stamp>.yaml --source samples/legacy_job.py   # report goes into that run folder
+python -m agentic.validator --spec output/<input file>_<stamp>/pipeline_spec_<stamp>.yaml --source samples/legacy_job.py   # report goes into that run folder
 python -m agentic.validator ... --agent offline     # scripted review loop, no network
 python -m agentic.validator ... --agent llm         # LLM review (provider from config.yaml)
 ```

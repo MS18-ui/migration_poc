@@ -18,8 +18,8 @@ if __name__ == "__main__":
     p.add_argument("--metadata-alias", action="append", default=[], metavar="JOB_NAME=CATALOG_NAME",
                    help="explicit table alias, used only when the job's name differs from the catalog's (repeatable)")
     p.add_argument("--out", default="output",
-                   help="base output folder (default: output). Each run writes all its files into one subfolder, "
-                        "<out>/run_<YYYYMMDD>_<HHMMSS>/, named <name>_<YYYYMMDD>_<HHMMSS>.<ext>")
+                   help="base output folder (default: output). Each run writes all its files into one subfolder named "
+                        "<input file>_<YYYYMMDD>_<HHMMSS>, with files named <name>_<YYYYMMDD>_<HHMMSS>.<ext>")
     a = p.parse_args()
 
     cfg = metadata_settings()
@@ -31,7 +31,7 @@ if __name__ == "__main__":
         print(f"[metadata] snapshot {snapshot.id}: {len(snapshot.tables)} table(s) from {', '.join(snapshot.files)}")
         for w in snapshot.warnings:
             print("[metadata] warning:", w)
-    # record the step-by-step history (incl. full error text) in output/run_<stamp>/events_<stamp>.jsonl, like the UI does
+    # record the step-by-step history (incl. full error text) in <run folder>/events_<stamp>.jsonl, like the UI does
     events.bind(events.RunEvents())
     AgenticFramework(a.input, create_llm(a.provider), out_dir=a.out, source_type=a.type,
                      snapshot=snapshot, aliases=aliases).run()

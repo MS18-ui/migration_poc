@@ -90,7 +90,7 @@ metadata:
 
 # Web UI (python -m streamlit run ui/app.py): upload a job or pick one from a git repo, watch each step and file, query Hive/Trino.
 ui:
-  out_dir: output               # base folder; each migration writes into output/run_<stamp>/
+  out_dir: output               # base folder; each migration writes into output/<input file>_<date>_<time>/
   max_parallel_jobs: 2          # migrations/validations running at the same time
 
 # Read-only query tab. Hosts are blank until you fill them in (here or in the UI). Passwords are NEVER stored in this

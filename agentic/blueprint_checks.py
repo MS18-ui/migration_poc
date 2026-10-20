@@ -105,7 +105,7 @@ def check_findings(bp: PipelineBlueprint) -> List[str]:
             errors.append(f"{where}: severity must be one of {list(FINDING_SEVERITIES)}, got {f.get('severity')!r}")
         if f.get("confidence") is not None and f["confidence"] not in FINDING_CONFIDENCE:
             errors.append(f"{where}: confidence must be one of {list(FINDING_CONFIDENCE)}")
-        blocks = f.get("blocks")
+        blocks = f.get("blocks", [])   # an omitted `blocks` (empty values are not written to the readable YAML) means "blocks nothing"
         if not isinstance(blocks, list) or any(b not in FINDING_BLOCKS for b in blocks):
             errors.append(f"{where}: 'blocks' must be a list drawn from {list(FINDING_BLOCKS)} (use [] if it blocks nothing)")
         if f.get("status", "open") != "open":

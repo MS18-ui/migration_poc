@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from . import events as ev
 from .events import RunEvents, load_events
+from .outputs import is_run_dir
 
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 UPLOAD_EXTS = (".py", ".xml", ".sh", ".hql", ".sql", ".hive", ".xlsx", ".xls")
@@ -56,14 +57,18 @@ def read_run_meta(run_dir: str) -> Dict[str, Any]:
 
 
 def list_runs(out_dir: str) -> List[Dict[str, Any]]:
-    """Run folders under out_dir, newest first, each with its run_meta summary."""
+    """Run folders under out_dir (any folder that holds run files, e.g. `daily_job_20261020_153045`), newest first,
+    each with its run_meta summary. Housekeeping folders such as `_uploads` are skipped."""
     if not os.path.isdir(out_dir):
         return []
     runs = []
-    for name in sorted(os.listdir(out_dir), reverse=True):
+    for name in os.listdir(out_dir):
         p = os.path.join(out_dir, name)
-        if os.path.isdir(p) and name.startswith("run_"):
-            runs.append({"name": name, "path": p, **read_run_meta(p)})
+        if not name.startswith("_") and is_run_dir(p):
+            meta = read_run_meta(p)
+            runs.append({"name": name, "path": p, "_t": meta.get("started") or time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(p))),
+                         **meta})
+    runs.sort(key=lambda r: (r["_t"], r["name"]), reverse=True)
     return runs
 
 

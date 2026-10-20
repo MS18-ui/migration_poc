@@ -16,8 +16,8 @@ def main(argv=None) -> int:
     ap.add_argument("--spec", required=True, help="blueprint YAML (rich format)")
     ap.add_argument("--source", required=True, help="legacy source (.py PySpark or .hql/.sql)")
     ap.add_argument("--out", default=None,
-                    help="folder to write the report into. Default: the run folder (output/run_<stamp>/) that already "
-                         "holds --spec, or a new output/run_<stamp>/ if the spec lives elsewhere. Files are named "
+                    help="folder to write the report into. Default: the run folder that already holds --spec, or a new "
+                         "folder named after the spec under output/ if the spec lives elsewhere. Files are named "
                          "<name>_<YYYYMMDD>_<HHMMSS>.<ext>")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--n-random", type=int, default=10, help="random multi-row scenarios per node")
