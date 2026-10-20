@@ -64,3 +64,31 @@ Each agent has a `ToolRegistry`. Ingestion agents get a parser tool (`parse_oozi
 `parse_sqoop`, `scan_pyspark2`) plus `validate_yaml`; generation agents get a checker
 (`check_code`, `check_dag`, `check_sql`). `submit_final` only accepts validated output.
 Add a source: add a profile in `agents.py::_SOURCE_PROFILES` and an extension in `orchestrator.py`.
+
+## Validation agent (does the YAML capture all the source logic?)
+
+```
+python -m agentic.validator --spec output/pipeline_spec.yaml --source samples/legacy_job.py --out validation_out
+python -m agentic.validator ... --agent offline     # scripted review loop, no network
+python -m agentic.validator ... --agent llm         # LLM review (provider from config.yaml)
+```
+
+Writes `validation_report.md/.json` and `test_suite.json` (the minimized scenarios, with what each one kills).
+Result is **PASSED** / **FAILED** (error findings) / **INCOMPLETE** (a layer did not run); exit codes 0 / 1 / 3.
+
+| Layer | Needs Spark? | What it checks |
+|---|---|---|
+| Static (`coverage.py`, `compat.py`, `static_checks.py`) | no | source <-> YAML: reads/writes, constants, comparison operators and thresholds, join types, dedupe keys, window frames, Spark settings, created columns; executability of every operation; compatibility and security rules |
+| Column/type flow | yes | the graph is built on empty tables; Spark's analyzer reports unresolved columns per node |
+| Scenarios + oracles | yes | per node: boundary values of every constant, NULLs, empty/duplicate/missing collections, join key collisions; independent invariants (cardinalities) and source-derived boundary expectations |
+| Mutation testing + synthesis | yes | the YAML is perturbed (operator, threshold, join type, filter, dedupe, window...); every perturbation must change some test's result; survivors are searched for killing data |
+| Review agent | no | bounded tool loop; its findings are capped at "warning", flagged `origin: llm`, and never decide pass/fail |
+
+**Where it runs.** The Spark-backed layers execute the blueprint's operations (DataFrame API + Spark SQL
+expressions, exactly like the generated job) on small synthetic tables, so they need `pyspark` and Java: run it on the
+cluster host. `validator.spark.master` in `config.yaml` is `local[2]` (driver-only, fast for thousands of tiny runs);
+point it at `spark://spark-master:7077` to use the cluster itself (slower per run). It reads no Hive tables and writes
+nothing but a temp directory. Without Spark the static layer still runs and the report is INCOMPLETE.
+
+Tests: `python -m unittest discover -s tests -v`. Offline tests need no Spark; the Spark-backed ones are skipped
+(not passed) where Spark/Java are missing.

@@ -1,0 +1,11 @@
+anthropic
+pandas
+openpyxl
+pyyaml
+pydantic>=2
+sqlglot
+openai>=1.40        # Azure OpenAI provider
+azure-identity      # optional: Entra ID (keyless) auth for Azure OpenAI
+
+# Validation agent: the Spark-backed layers need pyspark + Java (use the cluster host, which already has them)
+# pyspark

@@ -1,0 +1,20 @@
+<workflow-app name="daily_sales" xmlns="uri:oozie:workflow:0.5">
+  <start to="import_orders"/>
+  <action name="import_orders">
+    <sqoop xmlns="uri:oozie:sqoop-action:0.2">
+      <command>import --connect jdbc:mysql://db/sales --table orders --target-dir /raw/orders</command>
+    </sqoop>
+    <ok to="clean_orders"/>
+    <error to="fail"/>
+  </action>
+  <action name="clean_orders">
+    <spark xmlns="uri:oozie:spark-action:0.1">
+      <name>clean</name>
+      <jar>clean_orders.py</jar>
+    </spark>
+    <ok to="end"/>
+    <error to="fail"/>
+  </action>
+  <kill name="fail"><message>Job failed</message></kill>
+  <end name="end"/>
+</workflow-app>

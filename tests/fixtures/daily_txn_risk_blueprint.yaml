@@ -1,0 +1,228 @@
+﻿job:
+  name: daily_txn_risk
+  domain: banking
+  use_case: Daily customer transaction risk scoring and AML detection (nested-type version)
+  engine: pyspark
+  engine_version: "2.4"
+  source_file: daily_txn_risk_job.py
+  parameters:
+    run_date: "2026-10-18"
+  spark_conf:
+    spark.sql.sources.partitionOverwriteMode: dynamic
+
+sources:
+  - id: txn
+    type: hive_table
+    object: curated.transactions
+    pre_filter: "txn_date = :run_date"
+    schema:
+      - { name: txn_id,     type: STRING }
+      - { name: account_id, type: STRING }
+      - { name: txn_type,   type: STRING }
+      - { name: amount,     type: "DECIMAL(18,2)" }
+      - { name: currency,   type: STRING }
+      - { name: status,     type: STRING }
+      - { name: txn_ts,     type: TIMESTAMP }
+      - name: counterparty
+        type: STRUCT
+        fields:
+          - { name: name,       type: STRING }
+          - { name: bank_bic,   type: STRING }
+          - { name: account_no, type: STRING }
+          - { name: country,    type: STRING }
+
+  - id: accounts
+    type: hive_table
+    object: curated.accounts
+    schema:
+      - { name: account_id,  type: STRING }
+      - { name: customer_id, type: STRING }
+      - { name: attributes,  type: MAP, key_type: STRING, value_type: STRING,
+          known_keys: [product_code, overdraft_limit, joint_holder, interest_tier] }
+
+  - id: customers
+    type: hive_table
+    object: curated.customers
+    schema:
+      - { name: customer_id, type: STRING }
+      - { name: segment,     type: STRING }
+      - name: addresses
+        type: ARRAY
+        element_type: STRUCT
+        fields:
+          - { name: type,       type: STRING }
+          - { name: line1,      type: STRING }
+          - { name: city,       type: STRING }
+          - { name: country,    type: STRING }
+          - { name: is_primary, type: BOOLEAN }
+
+  - id: fx
+    type: parquet
+    path: hdfs:///data/ref/fx_rates/
+    pre_filter: "rate_date = :run_date"
+    schema:
+      - { name: currency, type: STRING, rename_to: fx_currency }
+      - { name: usd_rate, type: "DECIMAL(18,6)" }
+
+  - id: hrc
+    type: hive_table
+    object: ref.high_risk_countries
+    schema:
+      - { name: country,    type: STRING, rename_to: hr_country }
+      - { name: risk_level, type: STRING }
+
+transformations:
+  - id: cust
+    type: nested_derive            # ARRAY<STRUCT> higher-order functions
+    inputs: [customers]
+    columns:
+      - { name: primary_address,   expr: "element_at(filter(addresses, a -> a.is_primary), 1)", op: array_filter_first }
+      - { name: residence_country, expr: "primary_address.country", op: struct_field }
+      - { name: address_countries, expr: "array_distinct(transform(addresses, a -> a.country))", op: array_transform_distinct }
+      - { name: multi_country_flag, expr: "size(address_countries) > 1" }
+    select: [customer_id, segment, residence_country, address_countries, multi_country_flag]
+
+  - id: acct
+    type: nested_derive            # MAP lookups
+    inputs: [accounts]
+    columns:
+      - { name: product_code,    expr: "attributes['product_code']", op: map_get }
+      - { name: overdraft_limit, expr: "CAST(attributes['overdraft_limit'] AS DOUBLE)", op: map_get }
+      - { name: is_joint,        expr: "attributes['joint_holder'] = 'Y'", op: map_get }
+    select: [account_id, customer_id, product_code, overdraft_limit, is_joint]
+
+  - id: posted
+    type: filter_dedupe_flatten    # STRUCT flatten
+    inputs: [txn]
+    filter: "status = 'POSTED'"
+    dedupe_keys: [txn_id]
+    columns:
+      - { name: cp_name,    expr: "counterparty.name",     op: struct_field }
+      - { name: cp_bic,     expr: "counterparty.bank_bic", op: struct_field }
+      - { name: cp_country, expr: "counterparty.country",  op: struct_field }
+
+  - id: enriched_joined
+    type: join
+    inputs: [posted, acct, cust, fx, hrc]
+    joins:
+      - { left: posted, right: acct, type: inner, on: [account_id] }
+      - { left: "*",    right: cust, type: inner, on: [customer_id] }
+      - { left: "*",    right: fx,   type: left,  on: "currency = fx_currency",  hint: broadcast(fx) }
+      - { left: "*",    right: hrc,  type: left,  on: "cp_country = hr_country", hint: broadcast(hrc) }
+
+  - id: enriched_derived
+    type: derive_columns
+    inputs: [enriched_joined]
+    columns:
+      - { name: amount_usd,      expr: "CAST(ROUND(amount * COALESCE(usd_rate, 1.0), 2) AS DOUBLE)" }
+      - { name: is_large_txn,    expr: "amount_usd >= 10000" }
+      - { name: is_cash,         expr: "txn_type IN ('CASH_DEP','CASH_WDL')" }
+      - { name: is_high_risk_cp, expr: "hr_country IS NOT NULL" }
+      - { name: is_cross_border, expr: "cp_country IS NOT NULL AND cp_country <> residence_country" }
+
+  - id: enriched_structuring
+    type: window
+    inputs: [enriched_derived]
+    window:
+      partition_by: [customer_id]
+      order_by: ["CAST(txn_ts AS BIGINT)"]
+      frame: "RANGE BETWEEN 259200 PRECEDING AND CURRENT ROW"   # 3 days in seconds
+    columns:
+      - { name: near_threshold,   expr: "CASE WHEN is_cash AND amount_usd BETWEEN 8000 AND 9999.99 THEN 1 ELSE 0 END" }
+      - { name: near_thr_cnt_3d,  expr: "SUM(near_threshold) OVER w" }
+      - { name: structuring_flag, expr: "near_thr_cnt_3d >= 3" }
+
+  - id: scored
+    type: build_array_of_struct    # ARRAY<STRUCT> construction + null filtering
+    inputs: [enriched_structuring]
+    output_column: fired_rules
+    element_schema: "STRUCT<rule_id:STRING, description:STRING, score:INT>"
+    rules:
+      - { rule_id: R01, description: "Cash structuring",                         score: 90, when: "structuring_flag" }
+      - { rule_id: R02, description: "High-risk counterparty country",           score: 70, when: "is_high_risk_cp" }
+      - { rule_id: R03, description: "Large transaction >= 10k USD",             score: 40, when: "is_large_txn" }
+      - { rule_id: R04, description: "Cross-border with multi-country profile",  score: 30, when: "is_cross_border AND multi_country_flag" }
+    post_filter: "filter(fired_raw, r -> r IS NOT NULL)"
+
+  - id: rule_rows
+    type: explode_aggregate        # EXPLODE then aggregate per (customer, rule)
+    inputs: [scored]
+    explode: { column: fired_rules, alias: r }
+    group_by: [customer_id, "r.rule_id AS rule_id"]
+    aggregations:
+      - { name: hit_count,        expr: "COUNT(txn_id)" }
+      - { name: total_amount_usd, expr: "SUM(amount_usd)" }
+      - { name: max_score,        expr: "MAX(r.score)" }
+
+  - id: reasons
+    type: collect_to_array_of_struct
+    inputs: [rule_rows]
+    group_by: [customer_id]
+    output:
+      name: risk_reasons
+      expr: "SORT_ARRAY(COLLECT_LIST(STRUCT(rule_id, hit_count, total_amount_usd, max_score)))"
+      type: "ARRAY<STRUCT<rule_id:STRING, hit_count:BIGINT, total_amount_usd:DOUBLE, max_score:INT>>"
+
+  - id: exposure
+    type: collect_to_map
+    inputs: [scored]
+    steps:
+      - { group_by: [customer_id, currency], agg: { usd: "SUM(amount_usd)" } }
+      - { group_by: [customer_id], agg: { exposure_by_currency: "MAP_FROM_ENTRIES(COLLECT_LIST(STRUCT(currency, usd)))" } }
+    output_type: "MAP<STRING,DOUBLE>"
+
+  - id: base
+    type: aggregate
+    inputs: [scored]
+    group_by: [customer_id, segment, residence_country]
+    aggregations:
+      - { name: address_countries,       expr: "FIRST(address_countries)" }
+      - { name: multi_country_flag,      expr: "FIRST(multi_country_flag)" }
+      - { name: txn_count,               expr: "COUNT(txn_id)" }
+      - { name: total_amount_usd,        expr: "SUM(amount_usd)" }
+      - { name: large_txn_count,         expr: "SUM(CASE WHEN is_large_txn THEN 1 ELSE 0 END)" }
+      - { name: structuring_flag,        expr: "MAX(structuring_flag)" }
+      - { name: counterparty_countries,  expr: "COLLECT_SET(cp_country)" }   # ARRAY<STRING>
+
+  - id: customer_risk_summary
+    type: join_derive
+    inputs: [base, reasons, exposure]
+    joins:
+      - { left: base, right: reasons,  type: left, on: [customer_id] }
+      - { left: "*",  right: exposure, type: left, on: [customer_id] }
+    columns:
+      - { name: risk_reasons, expr: "COALESCE(risk_reasons, CAST(ARRAY() AS ARRAY<STRUCT<rule_id:STRING,hit_count:BIGINT,total_amount_usd:DOUBLE,max_score:INT>>))" }
+      - { name: risk_score,   expr: "CASE WHEN SIZE(risk_reasons) = 0 THEN 10 ELSE ARRAY_MAX(TRANSFORM(risk_reasons, r -> r.max_score)) END", op: array_higher_order }
+      - { name: run_date,     expr: ":run_date" }
+
+targets:
+  - id: customer_daily_risk
+    input: customer_risk_summary
+    type: hive_table
+    object: risk.customer_daily_risk
+    format: parquet
+    mode: overwrite_dynamic_partition
+    method: insertInto
+    partition_by: [run_date]
+    schema:
+      - { name: customer_id,            type: STRING }
+      - { name: segment,                type: STRING }
+      - { name: residence_country,      type: STRING }
+      - { name: address_countries,      type: "ARRAY<STRING>" }
+      - { name: multi_country_flag,     type: BOOLEAN }
+      - { name: txn_count,              type: BIGINT }
+      - { name: total_amount_usd,       type: DOUBLE }
+      - { name: large_txn_count,        type: BIGINT }
+      - { name: structuring_flag,       type: BOOLEAN }
+      - { name: counterparty_countries, type: "ARRAY<STRING>" }
+      - { name: exposure_by_currency,   type: "MAP<STRING,DOUBLE>" }
+      - { name: risk_reasons,           type: "ARRAY<STRUCT<rule_id:STRING,hit_count:BIGINT,total_amount_usd:DOUBLE,max_score:INT>>" }
+      - { name: risk_score,             type: INT }
+
+lineage:
+  - { target_column: residence_country,       from: ["curated.customers.addresses[].country", "curated.customers.addresses[].is_primary"], via: [cust] }
+  - { target_column: address_countries,       from: ["curated.customers.addresses[].country"], via: [cust, base] }
+  - { target_column: counterparty_countries,  from: ["curated.transactions.counterparty.country"], via: [posted, base] }
+  - { target_column: exposure_by_currency,    from: ["curated.transactions.amount", "curated.transactions.currency", "fx.usd_rate"], via: [enriched_derived, exposure] }
+  - { target_column: "risk_reasons[].rule_id", from: ["curated.transactions.txn_type", "curated.transactions.amount", "curated.transactions.counterparty.country", "curated.customers.addresses[].country"], via: [scored, rule_rows, reasons] }
+  - { target_column: risk_score,              from: ["risk_reasons[].max_score"], via: [customer_risk_summary] }

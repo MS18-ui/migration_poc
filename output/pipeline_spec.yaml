@@ -1,0 +1,27 @@
+name: daily_sales
+source_system: oozie
+target_engine: pyspark_3.x
+global_configs:
+  oozie_workflow_name: daily_sales
+  on_error: fail
+steps:
+- step_id: 1
+  name: import_orders
+  type: source
+  action: sqoop_import
+  path: /raw/orders
+  depends_on: []
+  params:
+    jdbc_url: jdbc:mysql://db/sales
+    table: orders
+    command: import --connect jdbc:mysql://db/sales --table orders --target-dir /raw/orders
+- step_id: 2
+  name: clean_orders
+  type: transformation
+  action: run_pyspark_script
+  path: clean_orders.py
+  source: import_orders
+  depends_on:
+  - import_orders
+  params:
+    spark_app_name: clean

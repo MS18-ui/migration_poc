@@ -1,0 +1,443 @@
+name: daily_txn_risk
+source_system: pyspark2
+target_engine: pyspark_3.x
+job:
+  name: daily_txn_risk
+  domain: banking
+  use_case: Daily customer transaction risk and AML flags with nested-type rules
+  engine: pyspark
+  engine_version: '2.4'
+  source_file: daily_txn_risk.py
+  parameters:
+    run_date: '2026-10-18'
+  spark_conf:
+    spark.sql.sources.partitionOverwriteMode: dynamic
+sources:
+- id: src_transactions
+  type: hive_table
+  object: curated.transactions
+  pre_filter: txn_date = :run_date
+  schema:
+  - name: txn_id
+    type: STRING
+  - name: account_id
+    type: STRING
+  - name: txn_date
+    type: STRING
+  - name: txn_ts
+    type: TIMESTAMP
+  - name: txn_type
+    type: STRING
+  - name: status
+    type: STRING
+  - name: amount
+    type: DECIMAL(18,2)
+  - name: currency
+    type: STRING
+  - name: counterparty
+    type: STRUCT<name:STRING,bank_bic:STRING,account_no:STRING,country:STRING>
+- id: src_accounts
+  type: hive_table
+  object: curated.accounts
+  schema:
+  - name: account_id
+    type: STRING
+  - name: customer_id
+    type: STRING
+  - name: attributes
+    type: MAP<STRING,STRING>
+- id: src_customers
+  type: hive_table
+  object: curated.customers
+  schema:
+  - name: customer_id
+    type: STRING
+  - name: segment
+    type: STRING
+  - name: addresses
+    type: ARRAY<STRUCT<type:STRING,line1:STRING,city:STRING,country:STRING,is_primary:BOOLEAN>>
+- id: src_fx_rates
+  type: parquet
+  path: hdfs:///data/ref/fx_rates/
+  pre_filter: rate_date = :run_date
+  schema:
+  - name: currency
+    type: STRING
+  - name: usd_rate
+    type: DOUBLE
+  - name: rate_date
+    type: STRING
+- id: src_high_risk_countries
+  type: hive_table
+  object: ref.high_risk_countries
+  schema:
+  - name: country
+    type: STRING
+  - name: risk_level
+    type: STRING
+transformations:
+- id: t01_customer_profile
+  type: nested_derive
+  inputs:
+  - src_customers
+  columns:
+  - name: primary_address
+    expr: element_at(filter(addresses, a -> a.is_primary), 1)
+  - name: residence_country
+    expr: primary_address.country
+  - name: address_countries
+    expr: array_distinct(transform(addresses, a -> a.country))
+  - name: multi_country_flag
+    expr: size(address_countries) > 1
+  select:
+  - customer_id
+  - segment
+  - residence_country
+  - address_countries
+  - multi_country_flag
+- id: t02_account_profile
+  type: derive_columns
+  inputs:
+  - src_accounts
+  columns:
+  - name: product_code
+    expr: attributes['product_code']
+  - name: overdraft_limit
+    expr: CAST(attributes['overdraft_limit'] AS DOUBLE)
+  - name: is_joint
+    expr: attributes['joint_holder'] = 'Y'
+  select:
+  - account_id
+  - customer_id
+  - product_code
+  - overdraft_limit
+  - is_joint
+- id: t03_posted_txn
+  type: filter_dedupe_flatten
+  inputs:
+  - src_transactions
+  columns:
+  - name: cp_name
+    expr: counterparty.name
+  - name: cp_bic
+    expr: counterparty.bank_bic
+  - name: cp_country
+    expr: counterparty.country
+  filter: status = 'POSTED'
+  dedupe_keys:
+  - txn_id
+- id: t04_enriched_join
+  type: join
+  inputs:
+  - t03_posted_txn
+  - t02_account_profile
+  - t01_customer_profile
+  - src_fx_rates
+  - src_high_risk_countries
+  joins:
+  - left: t03_posted_txn
+    right: t02_account_profile
+    type: inner
+    'on':
+    - account_id
+  - left: '*'
+    right: t01_customer_profile
+    type: inner
+    'on':
+    - customer_id
+  - left: '*'
+    right: src_fx_rates
+    type: left
+    'on': currency = fx_currency
+    hint: broadcast
+  - left: '*'
+    right: src_high_risk_countries
+    type: left
+    'on': cp_country = hr_country
+    hint: broadcast
+- id: t05_txn_enriched
+  type: derive_columns
+  inputs:
+  - t04_enriched_join
+  columns:
+  - name: amount_usd
+    expr: CAST(ROUND(amount * COALESCE(usd_rate, 1.0), 2) AS DOUBLE)
+  - name: is_large_txn
+    expr: amount_usd >= 10000
+  - name: is_cash
+    expr: txn_type IN ('CASH_DEP', 'CASH_WDL')
+  - name: is_high_risk_cp
+    expr: hr_country IS NOT NULL
+  - name: is_cross_border
+    expr: cp_country IS NOT NULL AND cp_country <> residence_country
+- id: t06_structuring_window
+  type: window
+  inputs:
+  - t05_txn_enriched
+  columns:
+  - name: near_thr_cnt_3d
+    expr: SUM(CASE WHEN is_cash AND amount_usd BETWEEN 8000 AND 9999.99 THEN 1 ELSE
+      0 END)
+  - name: structuring_flag
+    expr: near_thr_cnt_3d >= 3
+  window:
+    partition_by:
+    - customer_id
+    order_by:
+    - CAST(txn_ts AS BIGINT)
+    frame: RANGE BETWEEN 259200 PRECEDING AND CURRENT ROW
+- id: t07_scored_txn
+  type: build_array_of_struct
+  inputs:
+  - t06_structuring_window
+  output_column: fired_rules
+  element_schema:
+  - name: rule_id
+    type: STRING
+  - name: description
+    type: STRING
+  - name: score
+    type: INT
+  rules:
+  - rule_id: R01
+    description: Cash structuring
+    score: 90
+    condition: structuring_flag
+  - rule_id: R02
+    description: High-risk counterparty country
+    score: 70
+    condition: is_high_risk_cp
+  - rule_id: R03
+    description: Large transaction >= 10k USD
+    score: 40
+    condition: is_large_txn
+  - rule_id: R04
+    description: Cross-border with multi-country profile
+    score: 30
+    condition: is_cross_border AND multi_country_flag
+  post_filter: r IS NOT NULL
+- id: t08_rule_hits
+  type: explode_aggregate
+  inputs:
+  - t07_scored_txn
+  group_by:
+  - customer_id
+  - r.rule_id AS rule_id
+  aggregations:
+  - name: hit_count
+    expr: COUNT(txn_id)
+  - name: total_amount_usd
+    expr: SUM(amount_usd)
+  - name: max_score
+    expr: MAX(r.score)
+  explode:
+    column: fired_rules
+    alias: r
+- id: t09_customer_reasons
+  type: collect_to_array_of_struct
+  inputs:
+  - t08_rule_hits
+  group_by:
+  - customer_id
+  output:
+    name: risk_reasons
+    expr: SORT_ARRAY(COLLECT_LIST(STRUCT(rule_id, hit_count, total_amount_usd, max_score)))
+    type: ARRAY<STRUCT<rule_id:STRING,hit_count:BIGINT,total_amount_usd:DOUBLE,max_score:INT>>
+- id: t10_currency_exposure
+  type: collect_to_map
+  inputs:
+  - t07_scored_txn
+  steps:
+  - 'GROUP BY customer_id, currency: usd = SUM(amount_usd)'
+  - 'GROUP BY customer_id: exposure_by_currency = MAP_FROM_ENTRIES(COLLECT_LIST(STRUCT(currency,
+    usd)))'
+  output_type: MAP<STRING,DOUBLE>
+- id: t11_customer_base
+  type: aggregate
+  inputs:
+  - t07_scored_txn
+  group_by:
+  - customer_id
+  - segment
+  - residence_country
+  aggregations:
+  - name: address_countries
+    expr: FIRST(address_countries)
+  - name: multi_country_flag
+    expr: FIRST(multi_country_flag)
+  - name: txn_count
+    expr: COUNT(txn_id)
+  - name: total_amount_usd
+    expr: SUM(amount_usd)
+  - name: large_txn_count
+    expr: SUM(CASE WHEN is_large_txn THEN 1 ELSE 0 END)
+  - name: structuring_flag
+    expr: MAX(structuring_flag)
+  - name: counterparty_countries
+    expr: COLLECT_SET(cp_country)
+- id: t12_customer_risk_summary
+  type: join_derive
+  inputs:
+  - t11_customer_base
+  - t09_customer_reasons
+  - t10_currency_exposure
+  columns:
+  - name: risk_reasons
+    expr: COALESCE(risk_reasons, CAST(ARRAY() AS ARRAY<STRUCT<rule_id:STRING,hit_count:BIGINT,total_amount_usd:DOUBLE,max_score:INT>>))
+  - name: risk_score
+    expr: CASE WHEN SIZE(risk_reasons) = 0 THEN 10 ELSE ARRAY_MAX(TRANSFORM(risk_reasons,
+      r -> r.max_score)) END
+  - name: run_date
+    expr: CAST(:run_date AS STRING)
+  joins:
+  - left: t11_customer_base
+    right: t09_customer_reasons
+    type: left
+    'on':
+    - customer_id
+  - left: '*'
+    right: t10_currency_exposure
+    type: left
+    'on':
+    - customer_id
+targets:
+- id: tgt_customer_daily_risk
+  input: t12_customer_risk_summary
+  type: hive_table
+  object: risk.customer_daily_risk
+  format: parquet
+  mode: overwrite_dynamic_partition
+  method: insert_into
+  partition_by:
+  - run_date
+  schema:
+  - name: customer_id
+    type: STRING
+  - name: segment
+    type: STRING
+  - name: residence_country
+    type: STRING
+  - name: address_countries
+    type: ARRAY<STRING>
+  - name: multi_country_flag
+    type: BOOLEAN
+  - name: txn_count
+    type: BIGINT
+  - name: total_amount_usd
+    type: DOUBLE
+  - name: large_txn_count
+    type: BIGINT
+  - name: structuring_flag
+    type: BOOLEAN
+  - name: counterparty_countries
+    type: ARRAY<STRING>
+  - name: exposure_by_currency
+    type: MAP<STRING,DOUBLE>
+  - name: risk_reasons
+    type: ARRAY<STRUCT<rule_id:STRING,hit_count:BIGINT,total_amount_usd:DOUBLE,max_score:INT>>
+  - name: risk_score
+    type: INT
+  - name: run_date
+    type: STRING
+  properties: {}
+lineage:
+- target_column: customer_id
+  from:
+  - src_customers.customer_id
+  via:
+  - t01_customer_profile
+  - t11_customer_base
+- target_column: segment
+  from:
+  - src_customers.segment
+  via:
+  - t01_customer_profile
+  - t11_customer_base
+- target_column: residence_country
+  from:
+  - src_customers.addresses
+  via:
+  - t01_customer_profile
+  - t11_customer_base
+- target_column: address_countries
+  from:
+  - src_customers.addresses
+  via:
+  - t01_customer_profile
+  - t11_customer_base
+- target_column: multi_country_flag
+  from:
+  - src_customers.addresses
+  via:
+  - t01_customer_profile
+  - t11_customer_base
+- target_column: txn_count
+  from:
+  - src_transactions.txn_id
+  via:
+  - t03_posted_txn
+  - t11_customer_base
+- target_column: total_amount_usd
+  from:
+  - src_transactions.amount
+  - src_fx_rates.usd_rate
+  via:
+  - t05_txn_enriched
+  - t11_customer_base
+- target_column: large_txn_count
+  from:
+  - src_transactions.amount
+  - src_fx_rates.usd_rate
+  via:
+  - t05_txn_enriched
+  - t11_customer_base
+- target_column: structuring_flag
+  from:
+  - src_transactions.txn_ts
+  - src_transactions.txn_type
+  - src_transactions.amount
+  - src_fx_rates.usd_rate
+  via:
+  - t05_txn_enriched
+  - t06_structuring_window
+  - t11_customer_base
+- target_column: counterparty_countries
+  from:
+  - src_transactions.counterparty
+  via:
+  - t03_posted_txn
+  - t11_customer_base
+- target_column: exposure_by_currency
+  from:
+  - src_transactions.currency
+  - src_transactions.amount
+  - src_fx_rates.usd_rate
+  via:
+  - t05_txn_enriched
+  - t10_currency_exposure
+  - t12_customer_risk_summary
+- target_column: risk_reasons
+  from:
+  - src_transactions.txn_type
+  - src_transactions.amount
+  - src_transactions.counterparty
+  - src_high_risk_countries.country
+  - src_customers.addresses
+  via:
+  - t05_txn_enriched
+  - t06_structuring_window
+  - t07_scored_txn
+  - t08_rule_hits
+  - t09_customer_reasons
+  - t12_customer_risk_summary
+- target_column: risk_score
+  from:
+  - risk_reasons.max_score
+  via:
+  - t08_rule_hits
+  - t12_customer_risk_summary
+- target_column: run_date
+  from:
+  - job.parameters.run_date
+  via:
+  - t12_customer_risk_summary
