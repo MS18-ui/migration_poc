@@ -376,25 +376,33 @@ def to_markdown(r: dict, html_name: str) -> str:
     return "\n".join(out)
 
 
-def compare(a: Source, b: Source, out_base: Optional[str] = None, now=None) -> dict:
-    """Build the report and write the Markdown, HTML and JSON files into a new run folder."""
+def render(a: Source, b: Source, stamp: str) -> dict:
+    """The report and the contents of its three files, named for `stamp`. Nothing is written."""
     report = build_report(a, b)
+    report["stamp"] = stamp
+    names = {"markdown": out_name("compare_report", stamp, "md"), "html": out_name("compare_diff", stamp, "html"),
+             "json": out_name("compare_record", stamp, "json")}
+    return {
+        "report": report,
+        "names": names,
+        "markdown": to_markdown(report, names["html"]),
+        "html": difflib.HtmlDiff(tabsize=4, wrapcolumn=100).make_file(
+            a.code.splitlines(), b.code.splitlines(), a.label, b.label, context=False),
+        "json": json.dumps(report, indent=2, default=str),
+    }
+
+
+def compare(a: Source, b: Source, out_base: Optional[str] = None, now=None) -> dict:
+    """Write the comparison into a new run folder under the output folder (used by the CLI and the API)."""
     folder, stamp = new_run_dir(out_base or ui_settings()["out_dir"], stamp_now(now),
                                 name=f"{safe_stem(a.label)}_vs_{safe_stem(b.label)}")
-    names = {"markdown": out_name("compare", stamp, "md"), "html": out_name("compare", stamp, "html"),
-             "json": out_name("compare", stamp, "json")}
-    paths = {k: os.path.join(folder, v) for k, v in names.items()}
-    report["stamp"] = stamp
-    markdown = to_markdown(report, names["html"])
-    html_doc = difflib.HtmlDiff(tabsize=4, wrapcolumn=100).make_file(
-        a.code.splitlines(), b.code.splitlines(), a.label, b.label, context=False)
-    with open(paths["markdown"], "w", encoding="utf-8") as fh:
-        fh.write(markdown)
-    with open(paths["html"], "w", encoding="utf-8") as fh:
-        fh.write(html_doc)
-    with open(paths["json"], "w", encoding="utf-8") as fh:
-        json.dump(report, fh, indent=2)
-    return {"folder": folder, "files": paths, "report": report, "markdown": markdown}
+    out = render(a, b, stamp)
+    paths = {}
+    for key, fname in out["names"].items():
+        paths[key] = os.path.join(folder, fname)
+        with open(paths[key], "w", encoding="utf-8") as fh:
+            fh.write(out[key])
+    return {"folder": folder, "files": paths, "report": out["report"], "markdown": out["markdown"]}
 
 
 def main(argv=None) -> int:

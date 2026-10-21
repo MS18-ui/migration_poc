@@ -17,6 +17,7 @@ from .metadata import Snapshot, apply_snapshot
 from .outputs import new_run_dir, out_name, stamp_now
 from .secrets import redact_secrets
 from .skills_loader import skill_provenance
+from .spark_compare import Source, render
 from .validation import ValidationEngine
 
 _EXT_MAP = {
@@ -44,7 +45,7 @@ def detect_source_type(path: str) -> str:
 
 
 STAGES = [("load", "Load and screen input"), ("hive", "Hive QL to Spark SQL"), ("ingest", "Analyse source to YAML blueprint"),
-          ("generate", "Generate PySpark and Airflow"), ("export", "Finish")]
+          ("generate", "Generate PySpark and Airflow"), ("compare", "Compare Spark 2 with Spark 3"), ("export", "Finish")]
 
 
 class AgenticFramework:
@@ -73,6 +74,7 @@ class AgenticFramework:
         self.blueprint: Optional[PipelineBlueprint] = None
         self.pyspark_code = ""
         self.airflow_code = ""
+        self.comparison: Optional[dict] = None   # summary of the Spark 2 vs Spark 3 comparison, when one was made
         self._written: Dict[str, str] = {}   # base name -> path, so each artifact is written once
         self._t0 = time.time()
 
@@ -271,12 +273,36 @@ class AgenticFramework:
             "metadata_snapshot": (bp.provenance.get("metadata_snapshot", {}).get("id") if bp is not None else None),
             "findings": len(bp.findings) if bp is not None else 0,
             "files": [os.path.basename(p) for p in self.output_files],
+            "comparison": self.comparison,
         }
         path = os.path.join(self.run_dir, out_name("run_meta", self.stamp, "json"))
         with open(path, "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=1, default=str)
         if path not in self.output_files:
             self.output_files.append(path)
+
+    # 4b ------------------------------------------------------------------------------
+    def compare_with_source(self):
+        """Deterministic (no LLM): the PySpark 2 source against the PySpark 3 script generated from it."""
+        if self.source_type != "pyspark2" or not self.pyspark_code:
+            return "skipped"
+        self._start_run()
+        print("[4b/5 Compare] Spark 2 and Spark 3 comparison...")
+        src2 = Source(os.path.basename(self.input_path), self.model_text)   # the screened text, never the raw secrets
+        src3 = Source("generated_pipeline.py", self.pyspark_code)
+        try:
+            out = render(src2, src3, self.stamp)
+        except SyntaxError as e:
+            events.emit("note", message=f"comparison not performed: a job could not be parsed ({e})")
+            return "skipped"
+        self._write("Spark 2 vs Spark 3 comparison (report)", "compare_report", "md", out["markdown"])
+        self._write("Spark 2 vs Spark 3 comparison (side-by-side diff)", "compare_diff", "html", out["html"])
+        self._write("Spark 2 vs Spark 3 comparison (record)", "compare_record", "json", out["json"])
+        self.comparison = out["report"]["summary"]
+        s = self.comparison
+        events.emit("note", message=f"comparison: {s['sections']} sections, {s['rewritten']} rewritten, "
+                                    f"{s['same logic']} same logic, {s['only in one file']} in one file only")
+        print(f">> Comparison written: {s['rewritten']} rewritten, {s['same logic']} same logic.")
 
     def run(self):
         self._start_run()
@@ -285,6 +311,7 @@ class AgenticFramework:
             self._stage("hive", "Hive QL to Spark SQL", self.convert_hive_if_needed)
             self._stage("ingest", "Analyse source to YAML blueprint", self.run_ingestion_agent)
             self._stage("generate", "Generate PySpark and Airflow", self.run_generation_agents)
+            self._stage("compare", "Compare Spark 2 with Spark 3", self.compare_with_source)
             self._stage("export", "Finish", self.export_production_artifacts)
             events.emit("run_done", run_dir=self.run_dir, files=[os.path.basename(p) for p in self.output_files])
         except Exception as e:

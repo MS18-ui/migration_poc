@@ -21,6 +21,29 @@ def load_config() -> Dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 
+SECRET_WORDS = ("api_key", "password", "token", "secret")
+
+
+def _is_secret_key(key: str) -> bool:
+    k = key.lower()
+    return not k.endswith("_env") and any(w in k for w in SECRET_WORDS)   # `password_env` names a variable: not secret
+
+
+def _mask(node: Any, key: str = "") -> Any:
+    if isinstance(node, dict):
+        return {k: _mask(v, str(k)) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_mask(v, key) for v in node]
+    if _is_secret_key(key) and node not in (None, ""):
+        return "********"
+    return node
+
+
+def masked_config() -> Dict[str, Any]:
+    """The effective configuration file with every secret value replaced by ******** (for display only)."""
+    return _mask(load_config())
+
+
 def anthropic_settings() -> Dict[str, Any]:
     """Resolved Anthropic settings (config.yaml > env, since ANTHROPIC_* vars are often set
     ambiently by other tools); works for Azure Foundry via base_url."""

@@ -237,6 +237,11 @@ def build_pyspark_agent(llm: BaseLLM, blueprint: PipelineBlueprint, verbose: boo
         "partition_by (iceberg_table targets: df.writeTo(object) / MERGE INTO). "
         "Accept every job parameter as a command-line flag named --<param with _ replaced by ->, "
         "e.g. run_date -> --run-date. The script file is named generated_pipeline.py. "
+        "Mark the sections of the module-level code with these comment lines, in this order, so a reviewer can match "
+        "each section with the source: '# ---------- SOURCES ----------' before the sources are read; "
+        "'# ---------- T1: <short title> ----------', '# ---------- T2: <short title> ----------' and so on, one per "
+        "transformation of the blueprint in order (T1 first); '# ---------- TARGET ----------' before the write. "
+        "Do not indent these lines and do not put them inside functions. "
         "Always call check_code before submit_final and fix errors." +
         (" Then call " + " and ".join(t.name for t in rc_tools) + " (they execute the script on test data "
          "and compare it with a trusted baseline); fix every reported error or difference, and "

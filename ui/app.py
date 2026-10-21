@@ -9,11 +9,13 @@ Sections
   Run History  Reopen any earlier run from output/<input file>_<date>_<time>/ together with its step history and files.
   Data Query   Read-only Hive and Trino queries with a schema browser. A single SELECT, WITH, VALUES, SHOW, DESCRIBE or
                EXPLAIN statement is accepted per execution; result sets are size-limited and queries are time-limited.
+  Configuration  Connection details and the configuration file in YAML. Secrets are shown masked.
 
 Set AGENTIC_UI_PASSWORD to require an access password. Service credentials are read from the environment or from the local
 configuration file and are never entered on this page.
 """
 import hmac
+import json
 import os
 import sys
 import uuid
@@ -23,10 +25,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) 
 
 import pandas as pd  # noqa: E402
 import streamlit as st  # noqa: E402
+import streamlit.components.v1 as components  # noqa: E402
 import yaml  # noqa: E402
 
 from agentic import gitsource  # noqa: E402
-from agentic.config import metadata_settings, query_settings, ui_settings  # noqa: E402
+from agentic.config import masked_config, metadata_settings, query_settings, ui_settings  # noqa: E402
 from agentic.jobs import (JobManager, find_file, list_runs, run_events, run_files, save_upload,  # noqa: E402
                           zip_run)
 from agentic.metadata import load_snapshot  # noqa: E402
@@ -181,10 +184,73 @@ def render_run(run_dir: str, evs: List[Dict[str, Any]], status: str, label: str,
                            key=f"zip_{key}")
     else:
         st.caption("No files have been produced yet.")
+    comparison_block(run_dir)
     fdf = findings_df(run_dir)
     if fdf is not None:
         st.markdown(f"**Findings recorded in the blueprint ({len(fdf)})**")
         st.dataframe(fdf, use_container_width=True, hide_index=True)
+
+
+def comparison_block(run_dir: str) -> None:
+    """Spark 2 vs Spark 3 comparison made at the end of a PySpark 2 migration (only when the run produced one)."""
+    rec = find_file(run_dir, "compare_record_") if run_dir else None
+    if not rec:
+        return
+    try:
+        with open(rec, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        st.warning("The comparison record could not be read.")
+        return
+    s = data["summary"]
+    st.markdown("**Spark 2 and Spark 3 comparison**")
+    st.caption("Deterministic comparison of the PySpark 2 source with the generated PySpark 3 script. It shows where the logic "
+               "was rewritten and what changed in the sources, targets and settings. It does not prove equivalence: run both "
+               "versions on the same data as well.")
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Sections", s["sections"])
+    m2.metric("Rewritten", s["rewritten"])
+    m3.metric("Same logic", s["same logic"])
+    m4.metric("Lines of code, Spark 2", s["loc"]["spark2"])
+    m5.metric("Lines of code, Spark 3", s["loc"]["spark3"])
+    with st.expander("Step by step", expanded=True):
+        st.dataframe(pd.DataFrame([{"Section": x["section"], "Title": x["title"], "Spark 2 LOC": x["spark2_loc"],
+                                    "Spark 3 LOC": x["spark3_loc"], "Result": x["result"],
+                                    "Calls only in Spark 2": ", ".join(x["only_spark2"]),
+                                    "Calls only in Spark 3": ", ".join(x["only_spark3"])} for x in data["steps"]]),
+                     use_container_width=True, hide_index=True)
+    with st.expander("API evidence"):
+        st.dataframe(pd.DataFrame([{"Construct": e["construct"], "Spark 2": e["spark2"], "Spark 3": e["spark3"],
+                                    "What it means": e["meaning"]} for e in data["evidence"]]),
+                     use_container_width=True, hide_index=True)
+    with st.expander(f"Differences that can change the result ({len(data['differences'])})", expanded=bool(data["differences"])):
+        if data["differences"]:
+            st.dataframe(pd.DataFrame(data["differences"]), use_container_width=True, hide_index=True)
+        else:
+            st.write("None found by static comparison.")
+    diff = find_file(run_dir, "compare_diff_")
+    if diff:
+        with open(diff, encoding="utf-8", errors="replace") as f:
+            diff_html = f.read()
+        with st.expander("Side-by-side diff", expanded=False):
+            components.html(diff_html, height=640, scrolling=True)
+
+
+def flatten(node: Any, prefix: str = "") -> List[tuple]:
+    """Configuration as (setting path, value) rows."""
+    if isinstance(node, dict):
+        rows: List[tuple] = []
+        for k, v in node.items():
+            rows += flatten(v, f"{prefix}.{k}" if prefix else str(k))
+        return rows
+    if isinstance(node, list) and any(isinstance(x, (dict, list)) for x in node):
+        rows = []
+        for i, v in enumerate(node):
+            rows += flatten(v, f"{prefix}[{i}]")
+        return rows
+    if isinstance(node, list):
+        return [(prefix, ", ".join(str(x) for x in node) or "(empty list)")]
+    return [(prefix, "(not set)" if node in (None, "") else str(node))]
 
 
 def default_snapshot():
@@ -227,7 +293,7 @@ with st.sidebar:
     st.caption("Credentials are read from the environment or the local configuration file and are never entered on this page.")
 
 
-tab_mig, tab_runs, tab_q = st.tabs(["Migration", "Run History", "Data Query (Hive / Trino)"])
+tab_mig, tab_runs, tab_q, tab_cfg = st.tabs(["Migration", "Run History", "Data Query (Hive / Trino)", "Configuration"])
 
 
 # ---- Migration -------------------------------------------------------------------------------------------------
@@ -479,3 +545,17 @@ with tab_q:
                 for i, h in enumerate(hist):
                     st.code(h, language="sql")
                     st.button("Use This Statement", key=f"q_use_{i}", on_click=_use_sql, args=(h,))
+
+
+# ---- Configuration ---------------------------------------------------------------------------------------------------
+with tab_cfg:
+    st.caption("The configuration in effect, read from the local configuration file. Secrets are shown as ******** and are "
+               "never displayed. Credentials are read from the environment or the configuration file, never entered here.")
+    cfg = masked_config()
+    view = st.radio("View", ["Connection details", "Configuration (YAML)"], horizontal=True, key="cfg_view")
+    if view == "Configuration (YAML)":
+        st.code(yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True), language="yaml")
+    else:
+        flt = st.text_input("Filter by setting name", key="cfg_filter", placeholder="for example: host, port, uris, base_url")
+        rows = [{"Setting": p, "Value": v} for p, v in flatten(cfg) if flt.strip().lower() in p.lower()]
+        st.dataframe(pd.DataFrame(rows, columns=["Setting", "Value"]), use_container_width=True, hide_index=True)
