@@ -29,7 +29,12 @@ agentic/
   jobs.py                   background job runner + run history (used by the UI)
   gitsource.py              read-only git input (shallow https clone, safe paths)
   query/                    read-only Hive / Trino: guard.py, connectors.py
+  spark_compare.py          Spark 2 vs Spark 3 comparison (deterministic)
+  sqoop_yaml.py             Sqoop jobs -> intermediate YAML, contract family sqoop_to_spark (deterministic)
+  api.py                    HTTP API for the deterministic tools
 ui/app.py                   Streamlit workbench (Migration / Run History / Data Query)
+ui/compare_app.py           Streamlit page over the API (Spark compare / Sqoop to YAML / run code)
+sqoop_poc/                  Sqoop POC notebooks: Postgres -> Sqoop -> HDFS -> Hive, and Sqoop jobs -> YAML
 ```
 
 ## Run
@@ -134,6 +139,9 @@ python -m agentic.api --host 127.0.0.1 --port 8000        # docs at http://127.0
 - `GET /api/health`: liveness and whether execution is enabled.
 - `POST /api/compare`: body `{"spark2": {"code": "..."}, "spark3": {"path": "Claude_op/daily_txn_risk_job_spark3.py"}}`.
   A `path` must be inside the project folder.
+- `POST /api/sqoop-yaml`: body `{"sqoop": {"path": "samples/sqoop_jobs.txt"}, "ddl": {"code": "CREATE TABLE ..."},
+  "project_id": "sqoop_poc", "target_catalog": "ice", "target_namespace": "...", "target_storage": "..."}`.
+  `ddl` is optional; `trino_url` + `trino_schema` can replace it. See *Sqoop jobs to intermediate YAML* below.
 - `POST /api/execute`: body `{"code": "...", "mode": "check" | "run", "runner": "python" | "spark-submit", "timeout_seconds": 120, "env": {}}`.
   Needs `Authorization: Bearer <token>`, where the token is the `FRAMEWORK_API_TOKEN` environment variable. Without it, the
   endpoint returns 503. Execution is not a sandbox: it runs the code with the API process's privileges.
@@ -145,6 +153,49 @@ python -m streamlit run ui/compare_app.py --server.port 8502
 ```
 
 Set the API address and the token in the sidebar, or with `MIGRATION_API_URL` and `FRAMEWORK_API_TOKEN`.
+The page has three tabs: *Compare Spark 2 and Spark 3*, *Sqoop jobs to YAML* and *Check or run job code*.
+
+## Sqoop jobs to intermediate YAML (`sqoop_to_spark`)
+
+Deterministic tool (no LLM, no Sqoop), wired like the Spark comparison: module + CLI (`agentic/sqoop_yaml.py`), agent tool
+`sqoop_to_yaml` in `agentic/code_tools.py`, `POST /api/sqoop-yaml`, and the *Sqoop jobs to YAML* tab of `ui/compare_app.py`
+(upload the commands and, optionally, the source DDL; set the Iceberg target; view, download or ZIP the YAML files).
+
+```
+python -m agentic.sqoop_yaml samples/sqoop_jobs.txt --ddl 01_schema.sql \
+       --project-id sqoop_poc --target-catalog ice --target-namespace sqoop_poc_iceberg \
+       --target-storage hdfs://172.16.0.4:9000/user/hive/warehouse/sqoop_poc_iceberg.db
+```
+
+One YAML file per Sqoop job, in the shape PLAN.md section 3 asks for: common fields (project/job ids, revision, status,
+source files + hashes, target, parameters, dependencies, provenance, findings, versions, artifacts, review) plus the Sqoop
+fields (JDBC connection by secret reference, table or query, column mappings, split key, load mode and watermark state,
+destination).
+
+- The input file: Sqoop commands, one per line (`\` continuations and `sqoop job --create NAME -- import ...` work).
+- `--ddl` or `--trino` (+ `--trino-schema`): where the source column types come from. The DDL is the SOURCE database's
+  CREATE TABLE statements (Postgres style; primary keys and NOT NULL are used). Without either, mappings stay unknown and
+  a blocking finding says so. The Trino lookup goes through the read-only query connector (`agentic/query/`).
+- `--target-*`: the Iceberg destination. Never guessed: if missing, a finding blocks generation.
+
+Writes `output/<commands file>_<date>_<time>/` with `<job_id>_<stamp>.yaml` per job, `sqoop_yaml_<stamp>.md` (jobs,
+findings, coverage tables) and `sqoop_yaml_<stamp>.json`.
+
+What every file guarantees:
+- **No secrets.** The command is screened with `agentic/secrets.py`; only secret references are kept. A literal
+  `--password` raises a critical security finding.
+- **Every Sqoop option is accounted for** in `coverage`: represented (with the YAML path), irrelevant (with the reason),
+  unresolved or unsupported (with a finding).
+- **Nothing is changed silently.** Sqoop behaviors without a Spark equivalent (`--direct`, `--hive-drop-import-delims`,
+  exports, incremental state) become findings. Columns whose names suggest personal data raise a privacy finding;
+  nothing is masked automatically. Findings use the same categories and severities as the blueprint findings.
+- **Status stays `draft`, `execution_eligible: false`** until the repo has an installed `sqoop_to_spark` schema and
+  capability registry and the findings are reviewed.
+
+`sqoop_poc/sqoop_postgres_to_hive_poc.ipynb` builds the Postgres source and runs the Sqoop jobs (it reads the Postgres
+password from `PG_PASSWORD` or prompts; it needs `01_schema.sql`, `02_data.sql` and `03_incremental_changes.sql` next to
+it). `sqoop_poc/sqoop_to_yaml.ipynb` runs the converter and shows the findings and coverage.
+`tests/test_sqoop_yaml.py` checks that the output matches the YAML the original POC script generated.
 
 ## LLM providers
 

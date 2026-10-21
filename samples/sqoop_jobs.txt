@@ -1,0 +1,36 @@
+# Sqoop jobs from the Sqoop POC notebook (sections 4 and 5), written out as plain commands.
+# Postgres host: use the one your Sqoop actually connects to (172.16.0.4 internally, 172.171.240.8 externally).
+
+# ---- full loads (section 4)
+sqoop import --connect jdbc:postgresql://172.16.0.4:5432/sourcedb --username postgres --password-file /user/jovyan/.pg_sqoop.pw \
+  --fields-terminated-by '\001' --lines-terminated-by '\n' --null-string '\\N' --null-non-string '\\N' --hive-drop-import-delims \
+  --target-dir /data/sqoop_poc/raw/branches -m 1 --table branches -- --schema retail
+
+sqoop import --connect jdbc:postgresql://172.16.0.4:5432/sourcedb --username postgres --password-file /user/jovyan/.pg_sqoop.pw \
+  --fields-terminated-by '\001' --lines-terminated-by '\n' --null-string '\\N' --null-non-string '\\N' --hive-drop-import-delims \
+  --target-dir /data/sqoop_poc/raw/customers -m 4 --split-by c.customer_id \
+  --query "SELECT c.customer_id, c.customer_ref, c.full_name, c.email, c.segment::text AS segment, c.country, c.kyc_status, c.pep_flag, c.date_of_birth, c.onboard_ts, c.address::text AS address_json, array_to_string(c.tags, '|') AS tags, c.notes, c.updated_at FROM retail.customers c WHERE \$CONDITIONS"
+
+sqoop import --connect jdbc:postgresql://172.16.0.4:5432/sourcedb --username postgres --password-file /user/jovyan/.pg_sqoop.pw \
+  --fields-terminated-by '\001' --lines-terminated-by '\n' --null-string '\\N' --null-non-string '\\N' --hive-drop-import-delims \
+  --target-dir /data/sqoop_poc/raw/account_holders -m 4 --table account_holders --split-by account_id -- --schema retail
+
+sqoop import --connect jdbc:postgresql://172.16.0.4:5432/sourcedb --username postgres --password-file /user/jovyan/.pg_sqoop.pw \
+  --fields-terminated-by '\001' --lines-terminated-by '\n' --null-string '\\N' --null-non-string '\\N' --hive-drop-import-delims \
+  --target-dir /data/sqoop_poc/raw/fx_rates_log -m 1 --table fx_rates_log --autoreset-to-one-mapper -- --schema retail
+
+sqoop import --connect jdbc:postgresql://172.16.0.4:5432/sourcedb --username postgres --password-file /user/jovyan/.pg_sqoop.pw \
+  --fields-terminated-by '\001' --lines-terminated-by '\n' --null-string '\\N' --null-non-string '\\N' --hive-drop-import-delims \
+  --target-dir /data/sqoop_poc/raw/acct_enriched -m 4 --split-by a.account_id \
+  --query "SELECT a.account_id, a.account_no, c.customer_ref, c.full_name, c.segment::text AS segment, a.account_type, a.currency, a.balance, a.branch_code, b.branch_name, b.city, a.status FROM retail.accounts a JOIN retail.customers c ON c.customer_id = a.customer_id LEFT JOIN retail.branches b ON b.branch_code = a.branch_code WHERE \$CONDITIONS"
+
+# ---- incremental saved jobs (section 5)
+sqoop job --create poc_transactions_append -- import --connect jdbc:postgresql://172.16.0.4:5432/sourcedb --username postgres --password-file /user/jovyan/.pg_sqoop.pw \
+  --fields-terminated-by '\001' --lines-terminated-by '\n' --null-string '\\N' --null-non-string '\\N' --hive-drop-import-delims \
+  --table transactions --target-dir /data/sqoop_poc/raw/transactions --split-by txn_id -m 8 \
+  --incremental append --check-column txn_id --last-value 0 -- --schema retail
+
+sqoop job --create poc_accounts_lastmodified -- import --connect jdbc:postgresql://172.16.0.4:5432/sourcedb --username postgres --password-file /user/jovyan/.pg_sqoop.pw \
+  --fields-terminated-by '\001' --lines-terminated-by '\n' --null-string '\\N' --null-non-string '\\N' --hive-drop-import-delims \
+  --table accounts --target-dir /data/sqoop_poc/raw/accounts --split-by account_id -m 4 \
+  --incremental lastmodified --check-column updated_at --last-value "1970-01-01 00:00:00" --merge-key account_id -- --schema retail

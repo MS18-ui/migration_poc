@@ -1,4 +1,5 @@
-"""Spark 2 to Spark 3 comparison and job code execution, through the migration API (agentic/api.py).
+"""Spark 2 to Spark 3 comparison, Sqoop jobs to intermediate YAML, and job code execution, through the migration API
+(agentic/api.py).
 
 This page calls the API over HTTP, so it does not import the framework. Start the API first:
 
@@ -11,7 +12,9 @@ then the page:
 The API address and the execution token can be set in the sidebar, or through the environment variables
 MIGRATION_API_URL and FRAMEWORK_API_TOKEN. The token is never written to disk by this page.
 """
+import io
 import os
+import zipfile
 
 import requests
 import streamlit as st
@@ -21,7 +24,7 @@ DEFAULT_URL = os.environ.get("MIGRATION_API_URL", "http://127.0.0.1:8000")
 DEFAULT_TOKEN = os.environ.get("FRAMEWORK_API_TOKEN", "")
 RUN_DATE_DEFAULT = "2026-10-18"
 
-st.set_page_config(page_title="Spark Job Comparison and Execution", layout="wide")
+st.set_page_config(page_title="Migration Tools", layout="wide")
 
 
 def api(method: str, base: str, path: str, token: str = "", json_body=None, timeout: int = 60):
@@ -71,8 +74,8 @@ with st.sidebar:
             else:
                 st.info("Code execution is disabled on the API host.")
 
-st.title("Spark Job Comparison and Execution")
-tab_compare, tab_run = st.tabs(["Compare Spark 2 and Spark 3", "Check or run job code"])
+st.title("Migration Tools")
+tab_compare, tab_sqoop, tab_run = st.tabs(["Compare Spark 2 and Spark 3", "Sqoop jobs to YAML", "Check or run job code"])
 
 # ---------- compare ----------
 
@@ -144,6 +147,105 @@ with tab_compare:
             text = read_text(files[key])
             if text is not None:
                 col.download_button(label, text, file_name=os.path.basename(files[key]), mime=mime)
+        st.caption(f"Saved to {result['folder']}")
+
+# ---------- sqoop to yaml ----------
+
+with tab_sqoop:
+    st.write("Upload a file of Sqoop commands (one per line; `\\` continuations and `sqoop job --create` saved jobs "
+             "work) and, optionally, the source database's CREATE TABLE statements for the column mappings. The API "
+             "writes one draft YAML file per job. The conversion does not use an LLM or Sqoop.")
+    c1, c2 = st.columns(2)
+    with c1:
+        up_sqoop = st.file_uploader("Sqoop commands", type=["txt", "sh"], key="up_sqoop")
+    with c2:
+        up_ddl = st.file_uploader("Source table DDL (optional)", type=["sql", "ddl", "hql"], key="up_ddl")
+
+    with st.expander("Target and metadata settings"):
+        t1, t2 = st.columns(2)
+        project_id = t1.text_input("Project id", value="project_01")
+        target_catalog = t2.text_input("Iceberg catalog", help="Never guessed: if left empty, a finding blocks generation.")
+        target_namespace = t1.text_input("Iceberg namespace")
+        target_storage = t2.text_input("Warehouse location", help="For example hdfs://<namenode>:9000/user/hive/warehouse/<namespace>.db")
+        trino_url = t1.text_input("Trino URL (instead of DDL, optional)", disabled=bool(up_ddl),
+                                  help="Reads the column metadata from Trino's information_schema, read-only.")
+        trino_schema = t2.text_input("Trino catalog.schema", disabled=bool(up_ddl), help="For example hive.sqoop_poc_spark")
+
+    if st.button("Convert to YAML", type="primary", disabled=not up_sqoop):
+        body = {"sqoop": {"name": up_sqoop.name, "code": up_sqoop.getvalue().decode("utf-8")},
+                "project_id": project_id.strip() or "project_01"}
+        if up_ddl:
+            body["ddl"] = {"name": up_ddl.name, "code": up_ddl.getvalue().decode("utf-8")}
+        elif trino_url.strip():
+            body.update(trino_url=trino_url.strip(), trino_schema=trino_schema.strip() or None)
+        for key, value in [("target_catalog", target_catalog), ("target_namespace", target_namespace),
+                           ("target_storage", target_storage)]:
+            if value.strip():
+                body[key] = value.strip()
+        with st.spinner("Converting the Sqoop jobs..."):
+            data, err = api("POST", base_url, "/api/sqoop-yaml", json_body=body, timeout=180)
+        if err:
+            st.session_state.pop("sqoop_yaml", None)
+            st.error(err)
+        else:
+            st.session_state["sqoop_yaml"] = data
+
+    result = st.session_state.get("sqoop_yaml")
+    if result:
+        s = result["summary"]
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Jobs", s["jobs"])
+        m2.metric("Full loads", s["full"])
+        m3.metric("Incremental loads", s["incremental"])
+        m4.metric("Findings", s["findings"])
+        m5.metric("Blocking execution", s["blocking_execution"])
+        st.caption("Every file is a proposed draft (execution_eligible: false) until a sqoop_to_spark schema and "
+                   "capability registry are installed and the findings are reviewed.")
+        for w in result["warnings"]:
+            st.warning(w)
+
+        st.subheader("Jobs")
+        st.dataframe(
+            [{"Job": j["job_id"], "Lines": j["lines"], "Saved job": j["saved_job"] or "-", "Load mode": j["load_mode"],
+              "Source": j["source"], "Columns mapped": j["columns"], "Findings": j["findings"],
+              "Blocking execution": j["blocking_execution"]} for j in result["jobs"]],
+            use_container_width=True, hide_index=True)
+
+        st.subheader("Findings")
+        st.dataframe(
+            [{"Job": f["job"], "Id": f["id"], "Category": f["category"], "Severity": f["severity"],
+              "Blocks": f["blocks"], "Evidence": f["evidence"], "Resolution": f["resolution"]}
+             for f in result["findings"]],
+            use_container_width=True, hide_index=True)
+
+        st.subheader("Coverage: how every Sqoop option was handled")
+        st.dataframe(
+            [{"Job": c["job"], "Option": c["construct"], "Status": c["status"],
+              "YAML path, finding or reason": c["detail"]} for c in result["coverage"]],
+            use_container_width=True, hide_index=True)
+
+        st.subheader("YAML")
+        yamls = result["yaml"]
+        if yamls:
+            job = st.selectbox("Job", list(yamls))
+            st.code(yamls[job], language="yaml")
+            yaml_files = result["files"]["yaml"]
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for job_id, text in yamls.items():
+                    zf.writestr(os.path.basename(yaml_files[job_id]), text)
+            y1, y2, y3, y4 = st.columns(4)
+            y1.download_button("Download this YAML", yamls[job], file_name=os.path.basename(yaml_files[job]),
+                               mime="application/x-yaml")
+            y2.download_button("Download all YAML (ZIP)", buf.getvalue(),
+                               file_name=os.path.basename(result["folder"]) + ".zip", mime="application/zip")
+            for col, key, label, mime in [(y3, "markdown", "Download summary (Markdown)", "text/markdown"),
+                                          (y4, "json", "Download summary (JSON)", "application/json")]:
+                text = read_text(result["files"][key])
+                if text is not None:
+                    col.download_button(label, text, file_name=os.path.basename(result["files"][key]), mime=mime)
+        else:
+            st.info("No Sqoop command was found in the file.")
         st.caption(f"Saved to {result['folder']}")
 
 # ---------- run ----------

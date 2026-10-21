@@ -5,6 +5,7 @@
 
     GET  /api/health    liveness, and whether execution is enabled
     POST /api/compare   compare a Spark 2 job with its Spark 3 version (code in the body, or a path in the project)
+    POST /api/sqoop-yaml turn a file of Sqoop commands into intermediate YAML, one file per job (optional source DDL)
     POST /api/execute   check (compile) or run job code. Needs the header  Authorization: Bearer <token>
                         where <token> is the FRAMEWORK_API_TOKEN environment variable. Without that variable,
                         execution is disabled (503).
@@ -22,13 +23,14 @@ from pydantic import BaseModel, Field, model_validator
 
 from .code_exec import execute
 from .spark_compare import compare, load_source
+from .sqoop_yaml import Options, convert
 
 ROOT = Path(__file__).resolve().parent.parent     # the project folder; path inputs must stay inside it
 
 app = FastAPI(
     title="Migration framework API",
     version="1.0",
-    description="Compare Spark 2 and Spark 3 jobs, and check or run job code.",
+    description="Compare Spark 2 and Spark 3 jobs, turn Sqoop jobs into intermediate YAML, and check or run job code.",
 )
 
 
@@ -47,6 +49,26 @@ class JobInput(BaseModel):
 class CompareRequest(BaseModel):
     spark2: JobInput
     spark3: JobInput
+
+
+class SqoopYamlRequest(BaseModel):
+    sqoop: JobInput = Field(..., description="The Sqoop commands, one per line (\\ continuations and saved jobs work).")
+    ddl: Optional[JobInput] = Field(None, description="CREATE TABLE statements of the source database (column mappings).")
+    trino_url: Optional[str] = Field(None, description="Trino URL to read the column metadata instead of DDL.")
+    trino_schema: Optional[str] = Field(None, description="catalog.schema in Trino that holds the tables.")
+    project_id: str = "project_01"
+    sqoop_version: str = "1.4.7"
+    target_runtime: str = "Spark 3.5.x"
+    target_catalog: Optional[str] = Field(None, description="Iceberg catalog. Never guessed: missing is a finding.")
+    target_namespace: Optional[str] = None
+    target_storage: Optional[str] = None
+    environment_ref: Optional[str] = None
+
+    @model_validator(mode="after")
+    def one_metadata_source(self):
+        if self.ddl and self.trino_url:
+            raise ValueError("give either 'ddl' or 'trino_url' for the source metadata, not both")
+        return self
 
 
 class ExecuteRequest(BaseModel):
@@ -95,6 +117,16 @@ def compare_jobs(req: CompareRequest) -> dict:
     return {"summary": res["report"]["summary"], "steps": res["report"]["steps"],
             "evidence": res["report"]["evidence"], "differences": res["report"]["differences"],
             "folder": res["folder"], "files": res["files"]}
+
+
+@app.post("/api/sqoop-yaml")
+def sqoop_yaml(req: SqoopYamlRequest) -> dict:
+    opt = Options(req.project_id, req.sqoop_version, req.target_runtime, req.target_catalog, req.target_namespace,
+                  req.target_storage, req.environment_ref)
+    res = convert(_job(req.sqoop), _job(req.ddl) if req.ddl else None, opt, req.trino_url, req.trino_schema)
+    r = res["report"]
+    return {"summary": r["summary"], "jobs": r["jobs"], "findings": r["findings"], "coverage": r["coverage"],
+            "warnings": r["warnings"], "yaml": res["yaml"], "folder": res["folder"], "files": res["files"]}
 
 
 @app.post("/api/execute", dependencies=[Depends(require_token)])
