@@ -114,6 +114,38 @@ on the page, and the interface does not expose provider or model settings.
 The UI is a thin layer over `agentic/jobs.py` (job runner), `agentic/events.py` (step events), `agentic/gitsource.py`
 (read-only git input) and `agentic/query/` (guard + connectors), so a CLI or API can reuse them.
 
+## Spark 2 vs Spark 3 comparison, and code execution
+
+Deterministic tools (no LLM). Both are also registered in `agentic/code_tools.py` (`TOOLS`) for the tool-calling layer.
+
+```
+python -m agentic.spark_compare Claude_op/daily_txn_risk_job.py Claude_op/daily_txn_risk_job_spark3.py
+```
+
+Writes `output/daily_txn_risk_job_vs_daily_txn_risk_job_spark3_<date>_<time>/` with `compare_<stamp>.md` (step table,
+API evidence, differences that can change the result), `compare_<stamp>.html` (side-by-side diff) and `compare_<stamp>.json`.
+
+HTTP API:
+
+```
+python -m agentic.api --host 127.0.0.1 --port 8000        # docs at http://127.0.0.1:8000/docs
+```
+
+- `GET /api/health`: liveness and whether execution is enabled.
+- `POST /api/compare`: body `{"spark2": {"code": "..."}, "spark3": {"path": "Claude_op/daily_txn_risk_job_spark3.py"}}`.
+  A `path` must be inside the project folder.
+- `POST /api/execute`: body `{"code": "...", "mode": "check" | "run", "runner": "python" | "spark-submit", "timeout_seconds": 120, "env": {}}`.
+  Needs `Authorization: Bearer <token>`, where the token is the `FRAMEWORK_API_TOKEN` environment variable. Without it, the
+  endpoint returns 503. Execution is not a sandbox: it runs the code with the API process's privileges.
+
+Streamlit page for the same API (`ui/compare_app.py`). It calls the API over HTTP, so start the API first:
+
+```
+python -m streamlit run ui/compare_app.py --server.port 8502
+```
+
+Set the API address and the token in the sidebar, or with `MIGRATION_API_URL` and `FRAMEWORK_API_TOKEN`.
+
 ## LLM providers
 
 `agentic/llm.py` defines `BaseLLM`; each provider adapts its own message/tool format.

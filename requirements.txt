@@ -10,6 +10,10 @@ azure-identity      # optional: Entra ID (keyless) auth for Azure OpenAI
 # Validation agent: the Spark-backed layers need pyspark + Java (use the cluster host, which already has them)
 # pyspark
 
+# HTTP API (python -m agentic.api)
+fastapi
+uvicorn
+
 # Web UI (python -m streamlit run ui/app.py)
 streamlit>=1.37            # 1.37+ for auto-refreshing progress panels (st.fragment)
 trino                      # Trino queries in the UI
