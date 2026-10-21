@@ -17,7 +17,7 @@ from agentic.sqoop_yaml import Options, build_specs, convert, spec_yaml
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SQOOP = os.path.join(ROOT, "samples", "sqoop_jobs.txt")
-DDL = os.path.join(HERE, "fixtures", "sqoop_source_schema.sql")
+DDL = os.path.join(ROOT, "sqoop_poc", "01_schema.sql")
 EXPECTED = os.path.join(HERE, "fixtures", "sqoop_account_holders_expected.yaml")
 NOTEBOOK_SKILL = ".agents/skills/sqoop-to-spark@94b4b18"
 
@@ -123,7 +123,7 @@ class SqoopYamlApiCase(unittest.TestCase):
 
     def test_convert_by_path(self):
         r = self.client.post("/api/sqoop-yaml", json={
-            "sqoop": {"path": "samples/sqoop_jobs.txt"}, "ddl": {"path": "tests/fixtures/sqoop_source_schema.sql"},
+            "sqoop": {"path": "samples/sqoop_jobs.txt"}, "ddl": {"path": "sqoop_poc/01_schema.sql"},
             "project_id": "sqoop_poc", "target_catalog": "ice", "target_namespace": "sqoop_poc_iceberg",
             "target_storage": "hdfs://nn:9000/warehouse/sqoop_poc_iceberg.db"})
         self.assertEqual(r.status_code, 200, r.text)

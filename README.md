@@ -162,7 +162,7 @@ Deterministic tool (no LLM, no Sqoop), wired like the Spark comparison: module +
 (upload the commands and, optionally, the source DDL; set the Iceberg target; view, download or ZIP the YAML files).
 
 ```
-python -m agentic.sqoop_yaml samples/sqoop_jobs.txt --ddl 01_schema.sql \
+python -m agentic.sqoop_yaml samples/sqoop_jobs.txt --ddl sqoop_poc/01_schema.sql \
        --project-id sqoop_poc --target-catalog ice --target-namespace sqoop_poc_iceberg \
        --target-storage hdfs://172.16.0.4:9000/user/hive/warehouse/sqoop_poc_iceberg.db
 ```
@@ -193,8 +193,9 @@ What every file guarantees:
   capability registry and the findings are reviewed.
 
 `sqoop_poc/sqoop_postgres_to_hive_poc.ipynb` builds the Postgres source and runs the Sqoop jobs (it reads the Postgres
-password from `PG_PASSWORD` or prompts; it needs `01_schema.sql`, `02_data.sql` and `03_incremental_changes.sql` next to
-it). `sqoop_poc/sqoop_to_yaml.ipynb` runs the converter and shows the findings and coverage.
+password from `PG_PASSWORD` or prompts) with `sqoop_poc/01_schema.sql` (source tables: enum, JSONB, array,
+timestamptz, composite key, a table with no key), `02_data.sql` (generated data) and `03_incremental_changes.sql` (a day of
+changes for the incremental jobs). `sqoop_poc/sqoop_to_yaml.ipynb` runs the converter and shows the findings and coverage.
 `tests/test_sqoop_yaml.py` checks that the output matches the YAML the original POC script generated.
 
 ## LLM providers
