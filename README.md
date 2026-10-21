@@ -102,6 +102,10 @@ on the page, and the interface does not expose provider or model settings.
   its outcome, each file at the moment it is created (input, blueprint draft, catalog metadata, final YAML, SQL, PySpark
   script, DAG), the findings recorded in the blueprint, a ZIP download, and a *Validate YAML Blueprint* action (the static
   checks always; the Spark-backed checks where Spark and Java are available).
+  The *Stages and artifacts* selector shows the input code, each YAML stage, the generated Spark 3 code, the two side by
+  side, the Spark 2 vs Spark 3 comparison, and *Run and Trino output*: after an explicit confirmation, the generated script
+  is run with `spark-submit` on the UI host (master and Hive settings from `validation.cluster`; it writes to its target
+  table), the result is saved in the run folder as `run_output_<stamp>.json`, and the target table is queried through Trino.
 - **Run History**: reopens any earlier run folder under `output/` with its step history, files and findings.
 - **Data Query (Hive / Trino)**: a connection form (defaults from the `query:` section of `config.yaml`; passwords are
   entered on the page or read from `HIVE_PASSWORD` / `TRINO_PASSWORD` and are never stored), a schema browser (databases or

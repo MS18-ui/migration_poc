@@ -39,8 +39,20 @@ def check(code: str) -> dict:
     return {"status": "passed", "mode": "check", "error": ""}
 
 
+def _conf_flags(conf: Optional[Dict[str, str]]) -> list:
+    flags: list = []
+    for key, value in (conf or {}).items():
+        key = str(key)
+        if not key.startswith("spark."):
+            key = "spark.hadoop." + key   # spark-submit ignores bare Hadoop/Hive keys such as hive.metastore.uris
+        flags += ["--conf", f"{key}={value}"]
+    return flags
+
+
 def run(code: str, runner: str = "python", timeout: int = DEFAULT_TIMEOUT,
-        env: Optional[Dict[str, str]] = None) -> dict:
+        env: Optional[Dict[str, str]] = None, args: Optional[list] = None,
+        master: Optional[str] = None, spark_conf: Optional[Dict[str, str]] = None) -> dict:
+    """`args` are passed to the script; `master` and `spark_conf` apply to the spark-submit runner only."""
     if runner == "python":
         cmd_head = [sys.executable, "-I"]
     else:
@@ -48,7 +60,7 @@ def run(code: str, runner: str = "python", timeout: int = DEFAULT_TIMEOUT,
         if not exe:
             return {"status": "error", "mode": "run", "runner": runner,
                     "error": "spark-submit not found on PATH (set SPARK_SUBMIT to its full path)"}
-        cmd_head = [exe]
+        cmd_head = [exe] + (["--master", master] if master else []) + _conf_flags(spark_conf)
     timeout = min(max(int(timeout), 1), MAX_TIMEOUT)
     child_env = dict(os.environ, PYTHONIOENCODING="utf-8", **(env or {}))
     with tempfile.TemporaryDirectory(prefix="exec_") as tmp:
@@ -56,7 +68,7 @@ def run(code: str, runner: str = "python", timeout: int = DEFAULT_TIMEOUT,
             fh.write(code)
         started = time.time()
         try:
-            p = subprocess.run(cmd_head + ["job.py"], cwd=tmp, capture_output=True, text=True,
+            p = subprocess.run(cmd_head + ["job.py"] + [str(a) for a in (args or [])], cwd=tmp, capture_output=True, text=True,
                                encoding="utf-8", errors="replace", timeout=timeout, env=child_env)
         except subprocess.TimeoutExpired as e:
             return {"status": "timeout", "mode": "run", "runner": runner, "exit_code": None,
@@ -68,7 +80,8 @@ def run(code: str, runner: str = "python", timeout: int = DEFAULT_TIMEOUT,
 
 
 def execute(code: str, mode: str = "check", runner: str = "python", timeout: int = DEFAULT_TIMEOUT,
-            env: Optional[Dict[str, str]] = None) -> dict:
+            env: Optional[Dict[str, str]] = None, args: Optional[list] = None,
+            master: Optional[str] = None, spark_conf: Optional[Dict[str, str]] = None) -> dict:
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}")
     if runner not in RUNNERS:
@@ -77,4 +90,4 @@ def execute(code: str, mode: str = "check", runner: str = "python", timeout: int
         raise ValueError("code is empty")
     if mode == "check":
         return check(code)
-    return run(code, runner=runner, timeout=timeout, env=env)
+    return run(code, runner=runner, timeout=timeout, env=env, args=args, master=master, spark_conf=spark_conf)

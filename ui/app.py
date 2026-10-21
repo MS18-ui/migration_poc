@@ -14,10 +14,14 @@ Sections
 Set AGENTIC_UI_PASSWORD to require an access password. Service credentials are read from the environment or from the local
 configuration file and are never entered on this page.
 """
+import datetime
 import hmac
 import json
 import os
+import re
 import sys
+import threading
+import time
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -29,7 +33,10 @@ import streamlit.components.v1 as components  # noqa: E402
 import yaml  # noqa: E402
 
 from agentic import gitsource  # noqa: E402
-from agentic.config import masked_config, metadata_settings, query_settings, ui_settings  # noqa: E402
+from agentic.code_exec import execute  # noqa: E402
+from agentic.config import masked_config, metadata_settings, query_settings, ui_settings, validation_settings  # noqa: E402
+from agentic.outputs import out_name, stamp_now  # noqa: E402
+from agentic.spark_compare import facts_of  # noqa: E402
 from agentic.jobs import (JobManager, find_file, list_runs, run_events, run_files, save_upload,  # noqa: E402
                           zip_run)
 from agentic.metadata import load_snapshot  # noqa: E402
@@ -171,6 +178,7 @@ def render_run(run_dir: str, evs: List[Dict[str, Any]], status: str, label: str,
 
     all_files = run_files(run_dir) if run_dir and os.path.isdir(run_dir) else []
     labels = {e.get("name"): e.get("label") for e in evs if e.get("kind") == "file"}
+    stage_view(run_dir, all_files, key)
     show_tech = st.checkbox("Show technical files (run record, event log, traceability record)", key=f"tech_{key}")
     files = all_files if show_tech else [f for f in all_files if not f["name"].startswith(TECH_PREFIXES)]
     st.markdown(f"**Files ({len(files)})**")
@@ -184,7 +192,6 @@ def render_run(run_dir: str, evs: List[Dict[str, Any]], status: str, label: str,
                            key=f"zip_{key}")
     else:
         st.caption("No files have been produced yet.")
-    comparison_block(run_dir)
     fdf = findings_df(run_dir)
     if fdf is not None:
         st.markdown(f"**Findings recorded in the blueprint ({len(fdf)})**")
@@ -251,6 +258,193 @@ def flatten(node: Any, prefix: str = "") -> List[tuple]:
     if isinstance(node, list):
         return [(prefix, ", ".join(str(x) for x in node) or "(empty list)")]
     return [(prefix, "(not set)" if node in (None, "") else str(node))]
+
+
+# ---- stage view: input code, intermediate YAML, generated Spark 3 code, execution and Trino output -----------
+STAGE_VIEWS = [("Input code", "input_screened_"), ("YAML draft", "blueprint_agent_"), ("Catalog metadata", "catalog_metadata_"),
+               ("YAML blueprint", "pipeline_spec_"), ("Spark 3 code", "generated_pipeline_"), ("Airflow DAG", "airflow_dag_")]
+SIDE_BY_SIDE, COMPARISON, RUN_VIEW = "Source and Spark 3 side by side", "Spark 2 and Spark 3 comparison", "Run and Trino output"
+
+
+@st.cache_resource
+def get_script_runs() -> Dict[str, Dict[str, Any]]:
+    return {}
+
+
+SCRIPT_RUNS = get_script_runs()   # run folder -> state of the script run started from this page
+
+
+def read_text_file(path: Optional[str]) -> str:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except (OSError, TypeError):
+        return ""
+
+
+def default_run_date(run_dir: str) -> str:
+    m = re.search(r"run_date\s*=\s*[\"'](\d{4}-\d{2}-\d{2})[\"']", read_text_file(find_file(run_dir, "input_screened_")))
+    if m:
+        return m.group(1)
+    return str(((validation_settings().get("cluster") or {}).get("params") or {}).get("run_date")
+               or datetime.date.today().isoformat())
+
+
+def trino_conn() -> Dict[str, Any]:
+    """Trino connection: the Data Query tab's current entries, else the configured defaults."""
+    d, ss = query_settings()["trino"], st.session_state
+    return {"host": ss.get("trino_host", d["host"]), "port": int(ss.get("trino_port", d["port"])),
+            "user": ss.get("trino_user", d["user"]), "http_scheme": ss.get("trino_scheme", d["http_scheme"]),
+            "catalog": ss.get("trino_catalog", d["catalog"]), "schema": ss.get("trino_schema", d["schema"]),
+            "verify": bool(ss.get("trino_verify", d["verify"])),
+            "password": ss.get("trino_pw", "") or os.getenv(d["password_env"], "")}
+
+
+def start_script_run(run_dir: str, code: str, run_date: str, timeout: int) -> None:
+    """Run the generated script with spark-submit in the background; the result is also saved in the run folder."""
+    cluster = validation_settings().get("cluster") or {}
+    args = ["--run-date", run_date] if "--run-date" in code else []
+    state: Dict[str, Any] = {"status": "running", "started": time.time(), "result": None}
+    SCRIPT_RUNS[run_dir] = state
+
+    def work() -> None:
+        try:
+            res = execute(code, mode="run", runner="spark-submit", timeout=timeout, env={"RUN_DATE": run_date},
+                          args=args, master=cluster.get("master"), spark_conf=cluster.get("spark_conf"))
+        except Exception as e:  # reported on the page, never raised in the thread
+            res = {"status": "error", "error": f"{type(e).__name__}: {e}", "stdout": "", "stderr": ""}
+        res.update({"run_date": run_date, "arguments": args, "finished": time.strftime("%Y-%m-%d %H:%M:%S")})
+        state["result"], state["status"] = res, "done"
+        try:
+            with open(os.path.join(run_dir, out_name("run_output", stamp_now(), "json")), "w", encoding="utf-8") as f:
+                json.dump(res, f, indent=1, default=str)
+        except OSError:
+            pass
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+def show_script_result(res: Dict[str, Any]) -> None:
+    status = res.get("status")
+    when = f" Finished {res['finished']}." if res.get("finished") else ""
+    if status == "passed":
+        st.success(f"The script completed (exit code 0, {res.get('duration_s')} s, run date {res.get('run_date')}).{when}")
+    elif status == "timeout":
+        st.error(f"The script was stopped at the time limit. {res.get('error') or ''}")
+    else:
+        st.error(f"The script did not complete ({status}). {res.get('error') or 'See the error output below.'}")
+    if res.get("stdout"):
+        with st.expander("Standard output"):
+            st.code(res["stdout"][-20000:], language=None)
+    if res.get("stderr"):
+        with st.expander("Error output (Spark log)", expanded=status != "passed"):
+            st.code(res["stderr"][-20000:], language=None)
+
+
+def run_block(run_dir: str, key: str) -> None:
+    script = find_file(run_dir, "generated_pipeline_")
+    if not script:
+        st.info("The Spark 3 script has not been generated yet.")
+        return
+    code = read_text_file(script)
+    try:
+        targets = facts_of(code).targets
+    except SyntaxError:
+        targets = []
+    st.caption("Runs the generated script with spark-submit on this host, using the Spark master and Hive settings in the "
+               "configuration (validation.cluster). The script is generated by a model from the legacy job and runs with "
+               "this application's privileges: review the Spark 3 code first. It writes to its target table.")
+    c1, c2 = st.columns(2)
+    run_date = c1.text_input("Run date", value=default_run_date(run_dir), key=f"rd_{key}")
+    timeout = c2.number_input("Time limit (seconds)", min_value=60, max_value=7200, value=1800, step=60, key=f"to_{key}")
+    shown = ", ".join(targets) or "the target table named in the script"
+    confirmed = st.checkbox(f"I confirm that the script may write to {shown} on the cluster for run date {run_date}.",
+                            key=f"ok_{key}")
+    state = SCRIPT_RUNS.get(run_dir)
+    running = bool(state and state["status"] == "running")
+    if st.button("Run Generated Script", type="primary", disabled=not (confirmed and run_date.strip()) or running,
+                 key=f"runbtn_{key}"):
+        start_script_run(run_dir, code, run_date.strip(), int(timeout))
+        state, running = SCRIPT_RUNS[run_dir], True
+    if running:
+        st.info(f"The script is running ({int(time.time() - state['started'])} s elapsed). The panel updates "
+                "automatically in the Migration tab; in Run History use Refresh.")
+        st.button("Refresh", key=f"runref_{key}")
+    res = state["result"] if state and state["status"] == "done" else None
+    if res is None and not running:
+        try:
+            res = json.loads(read_text_file(find_file(run_dir, "run_output_")) or "null")
+        except ValueError:
+            res = None
+    if res:
+        show_script_result(res)
+
+    st.markdown("**Output in Trino**")
+    qs, conn = query_settings(), trino_conn()
+    if not conn["host"]:
+        st.info("The Trino connection is not configured. Enter it in the Data Query tab or in the query.trino section of "
+                "the configuration file.")
+        return
+    table = st.text_input("Target table (schema.table)", value=targets[0] if targets else "", key=f"tt_{key}")
+    qualified = f"{conn['catalog'] or 'hive'}.{table.strip()}" if table.strip().count(".") == 1 else table.strip()
+    d1, d2 = st.columns(2)
+    by_date = d1.checkbox("Filter by run date (the table needs a run_date column)", value=True, key=f"bd_{key}")
+    limit = d2.number_input("Rows", min_value=1, max_value=1000, value=100, key=f"lim_{key}")
+    sql = f"SELECT * FROM {qualified}" + (f" WHERE run_date = '{run_date.strip()}'" if by_date else "") + f" LIMIT {int(limit)}"
+    st.code(sql, language="sql")
+    if st.button("Query Trino", key=f"trino_{key}", disabled=not table.strip()):
+        try:
+            with st.spinner("Querying Trino..."):
+                st.session_state[f"trino_out_{key}"] = run_query(
+                    "trino", conn, sql, row_limit=int(limit), timeout=int(qs["timeout_seconds"]),
+                    max_row_limit=int(qs["max_row_limit"]), log_path=qs["log"])
+        except QueryRejected as ex:
+            st.error(f"The statement was rejected (read-only access): {ex}")
+        except QueryError as ex:
+            st.error(str(ex))
+    out = st.session_state.get(f"trino_out_{key}")
+    if out is not None:
+        seen: Dict[str, int] = {}
+        cols = []
+        for c in out.columns:
+            seen[c] = seen.get(c, 0) + 1
+            cols.append(c if seen[c] == 1 else f"{c}_{seen[c]}")
+        st.caption(f"Trino: {len(out.rows)} row(s) returned; elapsed time {out.seconds} s.")
+        st.dataframe(pd.DataFrame(out.rows, columns=cols) if cols else pd.DataFrame(out.rows),
+                     use_container_width=True, hide_index=True)
+
+
+def stage_view(run_dir: str, all_files: List[Dict[str, Any]], key: str) -> None:
+    """Intermediate stages as views: the input code, each YAML stage, the generated code, the comparison and the run."""
+    names = [f["name"] for f in all_files]
+    has = lambda prefix: any(n.startswith(prefix) for n in names)  # noqa: E731
+    options = []
+    if has("input_screened_") and has("generated_pipeline_"):
+        options.append(SIDE_BY_SIDE)
+    options += [label for label, prefix in STAGE_VIEWS if has(prefix)]
+    if has("compare_record_"):
+        options.append(COMPARISON)
+    if has("generated_pipeline_"):
+        options.append(RUN_VIEW)
+    if not options:
+        return
+    st.markdown("**Stages and artifacts**")
+    view = st.radio("View", options, horizontal=True, key=f"view_{key}", label_visibility="collapsed")
+    if view == SIDE_BY_SIDE:
+        left, right = st.columns(2)
+        with left:
+            st.caption("Input code (credential-like values are masked)")
+            show_file(find_file(run_dir, "input_screened_"))
+        with right:
+            st.caption("Generated Spark 3 code")
+            show_file(find_file(run_dir, "generated_pipeline_"))
+    elif view == COMPARISON:
+        comparison_block(run_dir)
+    elif view == RUN_VIEW:
+        run_block(run_dir, key)
+    else:
+        prefix = dict(STAGE_VIEWS)[view]
+        show_file(find_file(run_dir, prefix))
 
 
 def default_snapshot():
