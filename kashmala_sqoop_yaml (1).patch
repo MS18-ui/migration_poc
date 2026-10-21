@@ -1,0 +1,2921 @@
+From 388f55b96d624f139a7bb1d1d9295a79542a4286 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 21 Oct 2026 01:21:41 +0000
+Subject: [PATCH 1/2] Add Sqoop jobs -> intermediate YAML converter, API
+ endpoint and UI tab
+
+Merges the Sqoop POC's sqoop_to_yaml.py into the framework as agentic/sqoop_yaml.py,
+wired the same way as the Spark 2 vs Spark 3 comparison:
+- module + CLI (python -m agentic.sqoop_yaml), one run folder under output/
+- agent tool sqoop_to_yaml in agentic/code_tools.py
+- POST /api/sqoop-yaml in agentic/api.py
+- "Sqoop jobs to YAML" tab in ui/compare_app.py
+
+Reuses existing tools instead of duplicating them: agentic.secrets for redaction,
+the read-only Trino connector for metadata lookups, spark_compare.load_source and
+outputs.new_run_dir. Adds the POC notebooks (password removed, outputs cleared),
+the sample Sqoop commands, and tests that check the output matches the YAML the
+original script generated.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018dZtx9qosUQnq7gAPRGRNh
+---
+ README.md                                     |  51 ++
+ agentic/api.py                                |  34 +-
+ agentic/code_tools.py                         |  34 +-
+ agentic/sqoop_yaml.py                         | 694 +++++++++++++++++
+ samples/sqoop_jobs.txt                        |  36 +
+ sqoop_poc/sqoop_postgres_to_hive_poc.ipynb    | 734 ++++++++++++++++++
+ sqoop_poc/sqoop_to_yaml.ipynb                 | 147 ++++
+ .../sqoop_account_holders_expected.yaml       | 240 ++++++
+ tests/fixtures/sqoop_source_schema.sql        |  56 ++
+ tests/test_sqoop_yaml.py                      | 147 ++++
+ ui/compare_app.py                             | 110 ++-
+ 11 files changed, 2276 insertions(+), 7 deletions(-)
+ create mode 100644 agentic/sqoop_yaml.py
+ create mode 100644 samples/sqoop_jobs.txt
+ create mode 100644 sqoop_poc/sqoop_postgres_to_hive_poc.ipynb
+ create mode 100644 sqoop_poc/sqoop_to_yaml.ipynb
+ create mode 100644 tests/fixtures/sqoop_account_holders_expected.yaml
+ create mode 100644 tests/fixtures/sqoop_source_schema.sql
+ create mode 100644 tests/test_sqoop_yaml.py
+
+diff --git a/README.md b/README.md
+index f5e5659..daf1521 100644
+--- a/README.md
++++ b/README.md
+@@ -29,7 +29,12 @@ agentic/
+   jobs.py                   background job runner + run history (used by the UI)
+   gitsource.py              read-only git input (shallow https clone, safe paths)
+   query/                    read-only Hive / Trino: guard.py, connectors.py
++  spark_compare.py          Spark 2 vs Spark 3 comparison (deterministic)
++  sqoop_yaml.py             Sqoop jobs -> intermediate YAML, contract family sqoop_to_spark (deterministic)
++  api.py                    HTTP API for the deterministic tools
+ ui/app.py                   Streamlit workbench (Migration / Run History / Data Query)
++ui/compare_app.py           Streamlit page over the API (Spark compare / Sqoop to YAML / run code)
++sqoop_poc/                  Sqoop POC notebooks: Postgres -> Sqoop -> HDFS -> Hive, and Sqoop jobs -> YAML
+ ```
+ 
+ ## Run
+@@ -134,6 +139,9 @@ python -m agentic.api --host 127.0.0.1 --port 8000        # docs at http://127.0
+ - `GET /api/health`: liveness and whether execution is enabled.
+ - `POST /api/compare`: body `{"spark2": {"code": "..."}, "spark3": {"path": "Claude_op/daily_txn_risk_job_spark3.py"}}`.
+   A `path` must be inside the project folder.
++- `POST /api/sqoop-yaml`: body `{"sqoop": {"path": "samples/sqoop_jobs.txt"}, "ddl": {"code": "CREATE TABLE ..."},
++  "project_id": "sqoop_poc", "target_catalog": "ice", "target_namespace": "...", "target_storage": "..."}`.
++  `ddl` is optional; `trino_url` + `trino_schema` can replace it. See *Sqoop jobs to intermediate YAML* below.
+ - `POST /api/execute`: body `{"code": "...", "mode": "check" | "run", "runner": "python" | "spark-submit", "timeout_seconds": 120, "env": {}}`.
+   Needs `Authorization: Bearer <token>`, where the token is the `FRAMEWORK_API_TOKEN` environment variable. Without it, the
+   endpoint returns 503. Execution is not a sandbox: it runs the code with the API process's privileges.
+@@ -145,6 +153,49 @@ python -m streamlit run ui/compare_app.py --server.port 8502
+ ```
+ 
+ Set the API address and the token in the sidebar, or with `MIGRATION_API_URL` and `FRAMEWORK_API_TOKEN`.
++The page has three tabs: *Compare Spark 2 and Spark 3*, *Sqoop jobs to YAML* and *Check or run job code*.
++
++## Sqoop jobs to intermediate YAML (`sqoop_to_spark`)
++
++Deterministic tool (no LLM, no Sqoop), wired like the Spark comparison: module + CLI (`agentic/sqoop_yaml.py`), agent tool
++`sqoop_to_yaml` in `agentic/code_tools.py`, `POST /api/sqoop-yaml`, and the *Sqoop jobs to YAML* tab of `ui/compare_app.py`
++(upload the commands and, optionally, the source DDL; set the Iceberg target; view, download or ZIP the YAML files).
++
++```
++python -m agentic.sqoop_yaml samples/sqoop_jobs.txt --ddl 01_schema.sql \
++       --project-id sqoop_poc --target-catalog ice --target-namespace sqoop_poc_iceberg \
++       --target-storage hdfs://172.16.0.4:9000/user/hive/warehouse/sqoop_poc_iceberg.db
++```
++
++One YAML file per Sqoop job, in the shape PLAN.md section 3 asks for: common fields (project/job ids, revision, status,
++source files + hashes, target, parameters, dependencies, provenance, findings, versions, artifacts, review) plus the Sqoop
++fields (JDBC connection by secret reference, table or query, column mappings, split key, load mode and watermark state,
++destination).
++
++- The input file: Sqoop commands, one per line (`\` continuations and `sqoop job --create NAME -- import ...` work).
++- `--ddl` or `--trino` (+ `--trino-schema`): where the source column types come from. The DDL is the SOURCE database's
++  CREATE TABLE statements (Postgres style; primary keys and NOT NULL are used). Without either, mappings stay unknown and
++  a blocking finding says so. The Trino lookup goes through the read-only query connector (`agentic/query/`).
++- `--target-*`: the Iceberg destination. Never guessed: if missing, a finding blocks generation.
++
++Writes `output/<commands file>_<date>_<time>/` with `<job_id>_<stamp>.yaml` per job, `sqoop_yaml_<stamp>.md` (jobs,
++findings, coverage tables) and `sqoop_yaml_<stamp>.json`.
++
++What every file guarantees:
++- **No secrets.** The command is screened with `agentic/secrets.py`; only secret references are kept. A literal
++  `--password` raises a critical security finding.
++- **Every Sqoop option is accounted for** in `coverage`: represented (with the YAML path), irrelevant (with the reason),
++  unresolved or unsupported (with a finding).
++- **Nothing is changed silently.** Sqoop behaviors without a Spark equivalent (`--direct`, `--hive-drop-import-delims`,
++  exports, incremental state) become findings. Columns whose names suggest personal data raise a privacy finding;
++  nothing is masked automatically. Findings use the same categories and severities as the blueprint findings.
++- **Status stays `draft`, `execution_eligible: false`** until the repo has an installed `sqoop_to_spark` schema and
++  capability registry and the findings are reviewed.
++
++`sqoop_poc/sqoop_postgres_to_hive_poc.ipynb` builds the Postgres source and runs the Sqoop jobs (it reads the Postgres
++password from `PG_PASSWORD` or prompts; it needs `01_schema.sql`, `02_data.sql` and `03_incremental_changes.sql` next to
++it). `sqoop_poc/sqoop_to_yaml.ipynb` runs the converter and shows the findings and coverage.
++`tests/test_sqoop_yaml.py` checks that the output matches the YAML the original POC script generated.
+ 
+ ## LLM providers
+ 
+diff --git a/agentic/api.py b/agentic/api.py
+index 14fe3fe..4eaeda0 100644
+--- a/agentic/api.py
++++ b/agentic/api.py
+@@ -5,6 +5,7 @@
+ 
+     GET  /api/health    liveness, and whether execution is enabled
+     POST /api/compare   compare a Spark 2 job with its Spark 3 version (code in the body, or a path in the project)
++    POST /api/sqoop-yaml turn a file of Sqoop commands into intermediate YAML, one file per job (optional source DDL)
+     POST /api/execute   check (compile) or run job code. Needs the header  Authorization: Bearer <token>
+                         where <token> is the FRAMEWORK_API_TOKEN environment variable. Without that variable,
+                         execution is disabled (503).
+@@ -22,13 +23,14 @@ from pydantic import BaseModel, Field, model_validator
+ 
+ from .code_exec import execute
+ from .spark_compare import compare, load_source
++from .sqoop_yaml import Options, convert
+ 
+ ROOT = Path(__file__).resolve().parent.parent     # the project folder; path inputs must stay inside it
+ 
+ app = FastAPI(
+     title="Migration framework API",
+     version="1.0",
+-    description="Compare Spark 2 and Spark 3 jobs, and check or run job code.",
++    description="Compare Spark 2 and Spark 3 jobs, turn Sqoop jobs into intermediate YAML, and check or run job code.",
+ )
+ 
+ 
+@@ -49,6 +51,26 @@ class CompareRequest(BaseModel):
+     spark3: JobInput
+ 
+ 
++class SqoopYamlRequest(BaseModel):
++    sqoop: JobInput = Field(..., description="The Sqoop commands, one per line (\\ continuations and saved jobs work).")
++    ddl: Optional[JobInput] = Field(None, description="CREATE TABLE statements of the source database (column mappings).")
++    trino_url: Optional[str] = Field(None, description="Trino URL to read the column metadata instead of DDL.")
++    trino_schema: Optional[str] = Field(None, description="catalog.schema in Trino that holds the tables.")
++    project_id: str = "project_01"
++    sqoop_version: str = "1.4.7"
++    target_runtime: str = "Spark 3.5.x"
++    target_catalog: Optional[str] = Field(None, description="Iceberg catalog. Never guessed: missing is a finding.")
++    target_namespace: Optional[str] = None
++    target_storage: Optional[str] = None
++    environment_ref: Optional[str] = None
++
++    @model_validator(mode="after")
++    def one_metadata_source(self):
++        if self.ddl and self.trino_url:
++            raise ValueError("give either 'ddl' or 'trino_url' for the source metadata, not both")
++        return self
++
++
+ class ExecuteRequest(BaseModel):
+     code: str = Field(..., min_length=1, description="Full Python source of the job.")
+     mode: Literal["check", "run"] = Field("check", description="check = compile only; run = execute.")
+@@ -97,6 +119,16 @@ def compare_jobs(req: CompareRequest) -> dict:
+             "folder": res["folder"], "files": res["files"]}
+ 
+ 
++@app.post("/api/sqoop-yaml")
++def sqoop_yaml(req: SqoopYamlRequest) -> dict:
++    opt = Options(req.project_id, req.sqoop_version, req.target_runtime, req.target_catalog, req.target_namespace,
++                  req.target_storage, req.environment_ref)
++    res = convert(_job(req.sqoop), _job(req.ddl) if req.ddl else None, opt, req.trino_url, req.trino_schema)
++    r = res["report"]
++    return {"summary": r["summary"], "jobs": r["jobs"], "findings": r["findings"], "coverage": r["coverage"],
++            "warnings": r["warnings"], "yaml": res["yaml"], "folder": res["folder"], "files": res["files"]}
++
++
+ @app.post("/api/execute", dependencies=[Depends(require_token)])
+ def execute_code(req: ExecuteRequest) -> dict:
+     try:
+diff --git a/agentic/code_tools.py b/agentic/code_tools.py
+index 2671f53..cd857be 100644
+--- a/agentic/code_tools.py
++++ b/agentic/code_tools.py
+@@ -1,10 +1,13 @@
+-"""Tools the agent can call: compare a Spark 2 job with its Spark 3 version, and check or run job code.
++"""Tools the agent can call: compare a Spark 2 job with its Spark 3 version, turn Sqoop jobs into intermediate YAML,
++and check or run job code.
+ 
+-The same functions back the CLIs (`agentic.spark_compare`, `agentic.code_exec`) and the HTTP API (`agentic.api`).
++The same functions back the CLIs (`agentic.spark_compare`, `agentic.sqoop_yaml`, `agentic.code_exec`) and the HTTP API
++(`agentic.api`).
+ Usage with the tool layer:  ToolRegistry(TOOLS).dispatch("compare_spark_jobs", {...})
+ """
+ from .code_exec import execute
+ from .spark_compare import compare, load_source
++from .sqoop_yaml import Options, convert
+ from .tools import ToolSpec
+ 
+ COMPARE_SCHEMA = {
+@@ -16,6 +19,19 @@ COMPARE_SCHEMA = {
+     "required": ["spark2_path", "spark3_path"],
+ }
+ 
++SQOOP_YAML_SCHEMA = {
++    "type": "object",
++    "properties": {
++        "sqoop_path": {"type": "string", "description": "Path to the file of Sqoop commands"},
++        "ddl_path": {"type": "string", "description": "Optional: CREATE TABLE statements of the source database"},
++        "project_id": {"type": "string"},
++        "target_catalog": {"type": "string", "description": "Iceberg catalog of the target tables"},
++        "target_namespace": {"type": "string", "description": "Iceberg namespace of the target tables"},
++        "target_storage": {"type": "string", "description": "Warehouse location of the target namespace"},
++    },
++    "required": ["sqoop_path"],
++}
++
+ EXECUTE_SCHEMA = {
+     "type": "object",
+     "properties": {
+@@ -36,6 +52,16 @@ def _compare_tool(args: dict) -> str:
+             f"{s['only in one file']} in one file only. Report: {res['files']['markdown']}")
+ 
+ 
++def _sqoop_yaml_tool(args: dict) -> str:
++    opt = Options(project_id=args.get("project_id") or "project_01", target_catalog=args.get("target_catalog"),
++                  target_namespace=args.get("target_namespace"), target_storage=args.get("target_storage"))
++    ddl = load_source(path=args["ddl_path"]) if args.get("ddl_path") else None
++    res = convert(load_source(path=args["sqoop_path"]), ddl, opt)
++    s = res["report"]["summary"]
++    return (f"OK: {s['jobs']} jobs ({s['full']} full, {s['incremental']} incremental), {s['findings']} findings, "
++            f"{s['blocking_execution']} blocking execution. Files: {res['folder']}")
++
++
+ def _execute_tool(args: dict) -> str:
+     r = execute(args["code"], mode=args.get("mode", "check"), runner=args.get("runner", "python"),
+                 timeout=args.get("timeout_seconds", 120))
+@@ -52,6 +78,10 @@ TOOLS = [
+              "Compare a Spark 2 job file with its Spark 3 rewrite step by step. Writes a Markdown report, a "
+              "side-by-side HTML diff and a JSON record. Deterministic; no LLM.",
+              _compare_tool, COMPARE_SCHEMA),
++    ToolSpec("sqoop_to_yaml",
++             "Turn a file of Sqoop commands into intermediate YAML (contract family sqoop_to_spark), one draft file "
++             "per job with findings and coverage of every option. Deterministic; no LLM.",
++             _sqoop_yaml_tool, SQOOP_YAML_SCHEMA),
+     ToolSpec("execute_job_code",
+              "Check (compile) or run the Python or spark-submit code of a job and return its output.",
+              _execute_tool, EXECUTE_SCHEMA),
+diff --git a/agentic/sqoop_yaml.py b/agentic/sqoop_yaml.py
+new file mode 100644
+index 0000000..6ed848f
+--- /dev/null
++++ b/agentic/sqoop_yaml.py
+@@ -0,0 +1,694 @@
++"""Sqoop jobs -> intermediate YAML, one file per job (contract family `sqoop_to_spark`). Deterministic: no LLM, no Sqoop.
++
++Input : a text file of Sqoop commands (one per line; `\\` line continuations and `sqoop job --create NAME -- import ...`
++        saved jobs work). Optional source table metadata, used for the column mappings: the source database's
++        CREATE TABLE statements (Postgres style: primary keys and NOT NULL are kept), or a Trino lookup.
++Output: the YAML of every Sqoop command, in the shape PLAN.md section 3 asks for: common fields (ids, revision, status,
++        source files + hashes, target, parameters, dependencies, provenance, findings, versions, artifacts, review)
++        plus the Sqoop fields (JDBC connection by secret reference, table or query, column mappings, split key,
++        load mode and watermark state, destination).
++
++No executable sqoop_to_spark schema is installed in the repository yet, so every file is a PROPOSED DRAFT with
++`execution_eligible: false` and a blocking finding that says so. Same inputs give the same YAML (no timestamps inside a
++job). Passwords are never written: the command is screened with agentic.secrets, and a literal --password is a
++critical finding.
++
++Outputs go into one folder under the output folder, named `<sqoop file name>_<date>_<time>`:
++    <job_id>_<stamp>.yaml   one per Sqoop command
++    sqoop_yaml_<stamp>.md   summary tables: jobs, findings, coverage of every Sqoop option
++    sqoop_yaml_<stamp>.json the same summary as data
++
++CLI:  python -m agentic.sqoop_yaml samples/sqoop_jobs.txt --ddl 01_schema.sql --project-id sqoop_poc \\
++          --target-catalog ice --target-namespace sqoop_poc_iceberg --target-storage hdfs://.../sqoop_poc_iceberg.db
++"""
++import argparse
++import hashlib
++import json
++import os
++import re
++import shlex
++import sys
++from dataclasses import dataclass
++from typing import Callable, Dict, List, Optional
++
++import yaml
++
++from .config import query_settings, ui_settings
++from .outputs import new_run_dir, out_name, safe_stem, stamp_now
++from .secrets import redact_secrets
++from .skills_loader import SKILLS_DIR, SOURCE_SKILL
++from .spark_compare import Source, load_source
++
++RULES_VERSION = "sqoop_rules 0.1"
++
++# Sqoop options and how they are represented ---------------------------------------------
++REPRESENTED = {  # option -> where it lives in the YAML
++    "--connect": "connection.jdbc_url", "--username": "connection.username",
++    "--password-file": "connection.authentication", "--table": "ingestion.read.table",
++    "--query": "ingestion.read.query", "--where": "ingestion.read.where", "--columns": "ingestion.read.columns",
++    "--split-by": "ingestion.split.split_by", "--num-mappers": "ingestion.split.parallelism",
++    "--incremental": "ingestion.load.mode", "--check-column": "ingestion.load.watermark.column",
++    "--last-value": "parameters.p_last_value", "--merge-key": "ingestion.load.merge_keys",
++    "--target-dir": "ingestion.destination.sqoop_landing", "--warehouse-dir": "ingestion.destination.sqoop_landing",
++    "--hive-table": "ingestion.destination.sqoop_landing", "--hive-database": "ingestion.destination.sqoop_landing",
++    "--map-column-hive": "ingestion.column_mappings", "--map-column-java": "ingestion.column_mappings",
++    "--fetch-size": "ingestion.read.fetch_size", "--boundary-query": "ingestion.read.boundary_query"}
++IRRELEVANT = {   # Sqoop text-file mechanics with no meaning for a Spark -> Iceberg write
++    "--fields-terminated-by": "Iceberg/Parquet stores typed columns; no field delimiter",
++    "--lines-terminated-by": "Iceberg/Parquet has no line delimiter",
++    "--null-string": "Iceberg stores real NULLs; no null marker string",
++    "--null-non-string": "Iceberg stores real NULLs; no null marker string",
++    "--as-textfile": "output file format is replaced by the Iceberg table format",
++    "--as-parquetfile": "output file format is replaced by the Iceberg table format",
++    "--as-avrodatafile": "output file format is replaced by the Iceberg table format",
++    "--delete-target-dir": "landing directory is not used by the Spark job",
++    "--verbose": "logging only",
++}
++FLAGGED = {   # represented, but their behavior needs a decision
++    "--hive-drop-import-delims": "Sqoop removed \\n, \\r and \\001 from text values; Spark JDBC does not. "
++                                 "Decide whether the target must keep that cleaning.",
++    "--autoreset-to-one-mapper": "Sqoop silently fell back to one mapper when no split key existed.",
++    "--hive-import": "Sqoop created/loaded a Hive table; the target is now an Iceberg table.",
++    "--hive-overwrite": "Sqoop replaced the whole Hive table; overwrite scope must be approved for Iceberg.",
++    "--append": "Sqoop appended files to the landing directory; append intent must be explicit.",
++}
++UNSUPPORTED = {"--direct": "database-specific fast path (e.g. COPY) with no Spark JDBC equivalent",
++               "--staging-table": "export staging semantics", "--update-key": "export update semantics",
++               "--update-mode": "export update semantics", "--batch": "export batching semantics",
++               "--call": "stored procedure export", "--export-dir": "export source directory",
++               "--compress": "codec of landing files", "--compression-codec": "codec of landing files",
++               "--driver": "custom JDBC driver class", "--connection-manager": "custom connection manager"}
++BOOL_FLAGS = {"--hive-drop-import-delims", "--hive-import", "--append", "--direct", "--as-parquetfile",
++              "--as-avrodatafile", "--as-textfile", "--autoreset-to-one-mapper", "--delete-target-dir",
++              "--create-hive-table", "--hive-overwrite", "--verbose", "-P", "--batch", "--compress"}
++SECRET_OPTS = {"--password", "--connection-param-file"}
++PII = [r"email", r"phone", r"mobile", r"ssn", r"birth", r"(^|_)dob$", r"(^|_)(first|last|full|middle)_name$",
++       r"^name$", r"address", r"(^|_)zip", r"postal", r"passport", r"tax_id", r"national_id", r"card",
++       r"iban", r"account_no", r"account_number"]
++
++
++def default_skill_ref() -> str:
++    """`agentic/skills/sqoop-to-spark@<hash>`: the version of the pair skill these rules implement."""
++    name = SOURCE_SKILL["sqoop"]
++    path = os.path.join(SKILLS_DIR, name, "SKILL.md")
++    try:
++        digest = hashlib.sha256(open(path, "rb").read()).hexdigest()[:7]
++    except OSError:
++        return "agentic/skills/%s" % name
++    return "agentic/skills/%s@%s" % (name, digest)
++
++
++@dataclass
++class Options:
++    """Target settings. The Iceberg destination is never guessed: a missing catalog/namespace/storage is a finding."""
++    project_id: str = "project_01"
++    sqoop_version: str = "1.4.7"
++    target_runtime: str = "Spark 3.5.x"
++    target_catalog: Optional[str] = None
++    target_namespace: Optional[str] = None
++    target_storage: Optional[str] = None
++    environment_ref: Optional[str] = None
++    skill_ref: Optional[str] = None
++
++
++# ---------------------------------------------------------------------------- reading inputs
++def read_commands(text: str):
++    """Return [((first_line, last_line), command_text)]."""
++    cmds, buf, start = [], "", None
++    for n, line in enumerate(text.splitlines(), 1):
++        line = line.rstrip("\r")
++        if not buf and (not line.strip() or line.strip().startswith("#")):
++            continue
++        if start is None:
++            start = n
++        if line.endswith("\\"):
++            buf += line[:-1] + " "
++            continue
++        cmds.append(((start, n), buf + line))
++        buf, start = "", None
++    if buf:
++        cmds.append(((start, start), buf))
++    return cmds
++
++
++def parse(cmd):
++    toks = shlex.split(cmd)
++    out = {"saved_job": None, "tool": None, "opts": {}, "connector_args": {}, "order": []}
++    if "job" in toks and "--create" in toks:
++        out["saved_job"] = toks[toks.index("--create") + 1]
++    for tool in ("import", "export", "import-all-tables", "eval", "merge"):
++        if tool in toks:
++            out["tool"] = tool
++            toks = toks[toks.index(tool) + 1:]
++            break
++    i = 0
++    while i < len(toks):
++        t = toks[i]
++        if t == "--":
++            rest = toks[i + 1:]
++            for k in range(0, len(rest) - 1, 2):
++                out["connector_args"][rest[k].lstrip("-")] = rest[k + 1]
++            break
++        if t in BOOL_FLAGS:
++            out["opts"][t] = True
++            out["order"].append(t)
++            i += 1
++        elif t.startswith("-") and i + 1 < len(toks):
++            out["opts"][t] = toks[i + 1]
++            out["order"].append(t)
++            i += 2
++        else:
++            i += 1
++    if "-m" in out["opts"]:
++        out["opts"]["--num-mappers"] = out["opts"].pop("-m")
++        out["order"] = ["--num-mappers" if o == "-m" else o for o in out["order"]]
++    return out
++
++
++def to_type(raw):
++    """Source type -> Spark SQL type for the target, plus a note when the mapping is not exact."""
++    t = " ".join(raw.lower().split())
++    m = re.match(r"^(character varying|varchar)\s*\(\d+\)$", t)
++    if m or t in ("text", "varchar", "character varying", "string", "clob"):
++        return "string", None
++    m = re.match(r"^(character|char|bpchar)\s*\((\d+)\)$", t)
++    if m:
++        return "string", "fixed-length char padding is not preserved"
++    m = re.match(r"^(numeric|decimal)\s*\((\d+)\s*,\s*(\d+)\)$", t)
++    if m:
++        return "decimal(%s,%s)" % (m.group(2), m.group(3)), None
++    simple = {"bigserial": "bigint", "bigint": "bigint", "int8": "bigint", "serial": "int", "integer": "int",
++              "int": "int", "int4": "int", "smallint": "int", "int2": "int", "boolean": "boolean", "bool": "boolean",
++              "date": "date", "timestamp": "timestamp_ntz", "timestamp without time zone": "timestamp_ntz",
++              "timestamptz": "timestamp", "timestamp with time zone": "timestamp", "double precision": "double",
++              "float8": "double", "real": "float", "float4": "float", "bytea": "binary", "uuid": "string"}
++    if t in simple:
++        note = None
++        if t in ("smallint", "int2"):
++            note = "widened to int (Iceberg has no smallint)"
++        if t in ("timestamptz", "timestamp with time zone"):
++            note = "time zone aware; Spark stores UTC instant, session time zone must be fixed"
++        return simple[t], note
++    if t in ("json", "jsonb"):
++        return "string", "%s read as text; must be cast in the extraction query" % t
++    if t.endswith("[]"):
++        inner, _ = to_type(t[:-2])
++        return "array<%s>" % inner, "Postgres array; Spark JDBC support must be verified"
++    if t in ("numeric", "decimal"):
++        return "decimal(38,10)", "unbounded numeric: scale must be confirmed"
++    return None, "type '%s' has no registered mapping (enum/user-defined?)" % raw.strip()
++
++
++def source_ddl_tables(text: str, origin: str) -> Dict[str, dict]:
++    """CREATE TABLE statements of the SOURCE database -> {schema.table: {columns, primary_key, origin}}.
++
++    Kept separate from agentic.metadata.parse_ddl, which reads Hive DDL and normalises types to Spark: here the source
++    types (Postgres NUMERIC, JSONB, arrays, enums...), primary keys and NOT NULL are needed as written."""
++    text = re.sub(r"--[^\n]*", "", text)
++    tables = {}
++    for m in re.finditer(r"create\s+table\s+(?:if\s+not\s+exists\s+)?([\w\.]+)\s*\(", text, re.I):
++        i, depth, j = m.end(), 1, m.end()
++        while j < len(text) and depth:
++            depth += {"(": 1, ")": -1}.get(text[j], 0)
++            j += 1
++        body, cols, pk, cur, d = text[i:j - 1], [], [], "", 0
++        parts = []
++        for ch in body:
++            d += {"(": 1, ")": -1}.get(ch, 0)
++            if ch == "," and d == 0:
++                parts.append(cur)
++                cur = ""
++            else:
++                cur += ch
++        parts.append(cur)
++        for p in parts:
++            p = " ".join(p.split())
++            km = re.match(r"^primary key\s*\((.+)\)", p, re.I)
++            if km:
++                pk = [c.strip() for c in km.group(1).split(",")]
++                continue
++            if not p or re.match(r"^(constraint|unique|foreign|check)\b", p, re.I):
++                continue
++            name, rest = p.split(" ", 1)
++            stop = re.search(r"\b(not null|null|primary key|references|default|check|unique)\b", rest, re.I)
++            src_type = (rest[:stop.start()] if stop else rest).strip()
++            nullable = False if re.search(r"\bnot null\b|\bprimary key\b", rest, re.I) else None
++            if re.search(r"\bprimary key\b", rest, re.I):
++                pk = [name]
++            cols.append({"name": name.lower(), "source_type": src_type, "nullable": nullable})
++        tables[m.group(1).lower()] = {"columns": cols, "primary_key": pk, "origin": "ddl:%s" % origin}
++    return tables
++
++
++def trino_table(url: str, fq: str) -> Optional[dict]:
++    """Columns of catalog.schema.table from Trino's information_schema, through the read-only query connector."""
++    from .query.connectors import run_query
++    from .query.guard import safe_identifier
++
++    m = re.match(r"^(https?)://([^:/]+)(?::(\d+))?", url)
++    if not m:
++        raise ValueError("not an http(s) URL: %s" % url)
++    cat, sch, tbl = (safe_identifier(p) for p in fq.split("."))
++    conn = {"host": m.group(2), "port": int(m.group(3) or 8080), "http_scheme": m.group(1), "user": "sqoop_to_yaml"}
++    q = query_settings()
++    res = run_query("trino", conn, "SELECT column_name, data_type, is_nullable FROM %s.information_schema.columns "
++                    "WHERE table_schema = '%s' AND table_name = '%s' ORDER BY ordinal_position" % (cat, sch, tbl),
++                    timeout=q["timeout_seconds"], log_path=q["log"])
++    rows = res.rows
++    return {"columns": [{"name": r[0], "source_type": r[1], "nullable": (False if r[2] == "NO" else None)} for r in rows],
++            "primary_key": [], "origin": "trino:%s" % fq} if rows else None
++
++
++# ------------------------------------------------------------------------------- building
++class Builder(object):
++    def __init__(self, job_id):
++        self.job_id = job_id
++        self.findings, self.coverage, self.prov = [], [], []
++
++    def provenance(self, pid, locator, method):
++        self.prov.append({"id": pid, "file_ref": "file_sqoop", "locator": locator, "extraction_method": method})
++        return pid
++
++    def finding(self, category, severity, text, blocks, affected, resolution, confidence="high",
++                source_ref=None, rule=None):
++        fid = "F%02d" % (len(self.findings) + 1)
++        self.findings.append({
++            "id": "%s.%s" % (self.job_id, fid), "category": category, "severity": severity,
++            "confidence": confidence, "source_ref": source_ref, "evidence": text,
++            "affected_refs": affected, "blocks": blocks, "status": "open",
++            "resolution": resolution, "rule_ref": rule and "%s/%s" % (RULES_VERSION, rule)})
++        return "%s.%s" % (self.job_id, fid)
++
++    def cover(self, construct, status, refs=None, finding=None, reason=None):
++        c = {"construct": construct, "status": status}
++        if refs:
++            c["refs"] = refs
++        if finding:
++            c["finding_refs"] = [finding]
++        if reason:
++            c["reason"] = reason
++        self.coverage.append(c)
++
++
++def build(job, lines, raw_cmd, sqoop_label: str, opt: Options, meta_lookup: Callable, file_sha: str,
++          query_by_name: bool = False) -> dict:
++    """One job's spec. `query_by_name`: look up a free-form query's columns by the landed table's name (Trino)."""
++    o = job["opts"]
++    name = (o.get("--hive-table") or (o.get("--target-dir") or "").rstrip("/").split("/")[-1]
++            or (o.get("--table") or "query")).split(".")[-1].lower()
++    job_id = re.sub(r"[^a-z0-9_]", "_", job["saved_job"] or name)
++    b = Builder(job_id)
++    src_ref = "%s:%d-%d" % (os.path.basename(sqoop_label), lines[0], lines[1])
++    b.provenance("prov_cmd", "lines %d-%d" % lines, "shlex_parse_%s" % RULES_VERSION.replace(" ", "_"))
++
++    # ---- direction
++    direction = {"import": "import", "export": "export", "import-all-tables": "import_all_tables"}.get(job["tool"], job["tool"])
++    if direction != "import":
++        b.finding("unsupported_logic", "critical", "Sqoop tool '%s' is not a single-table import." % job["tool"],
++                  ["generation", "execution"], [job_id], "Only full imports are in the POC subset; treat separately.",
++                  source_ref=src_ref, rule="direction")
++
++    # ---- connection (never secrets)
++    url = o.get("--connect", "")
++    m = re.match(r"jdbc:(\w+)://([^/:]+)(?::(\d+))?/([^?;]+)", url)
++    system = {"postgresql": "postgres"}.get(m.group(1), m.group(1)) if m else None
++    auth = {"method": None, "secret_ref": None}
++    if o.get("--password-file"):
++        auth = {"method": "password_file", "secret_ref": o["--password-file"]}
++    elif o.get("-P"):
++        auth = {"method": "interactive_prompt", "secret_ref": None}
++    if o.get("--password"):
++        auth = {"method": "inline_password", "secret_ref": None}
++        b.finding("security", "critical", "The command contains a literal --password value (redacted in this file).",
++                  ["execution"], [job_id], "Rotate the password and use a secret reference.", source_ref=src_ref, rule="inline_secret")
++    if not auth["secret_ref"]:
++        b.finding("configuration", "high", "No secret reference for the JDBC login.", ["execution"], ["conn_source"],
++                  "Supply a secret reference (vault / Kubernetes secret / password file).", source_ref=src_ref, rule="secret_ref")
++    connection = {"id": "conn_source", "type": "jdbc", "system": system,
++                  "jdbc_url": redact_secrets(url)[0] if url else None,
++                  "host": m.group(2) if m else None, "port": int(m.group(3)) if m and m.group(3) else None,
++                  "database": m.group(4) if m else None, "username": o.get("--username"),
++                  "authentication": auth, "properties": dict(job["connector_args"]) or {}, "evidence_refs": ["prov_cmd"]}
++
++    # ---- read
++    schema = job["connector_args"].get("schema")
++    table = o.get("--table")
++    query = o.get("--query")
++    obj = (table if table and "." in table else "%s.%s" % (schema, table) if table and schema else table)
++    read = {"mode": "query" if query else "table", "table": obj, "query": None, "columns": None,
++            "where": o.get("--where"), "fetch_size": int(o["--fetch-size"]) if o.get("--fetch-size") else None,
++            "boundary_query": o.get("--boundary-query"), "consistency": "unknown"}
++    if query:
++        read["query"] = " ".join(query.replace("$CONDITIONS", "1=1").split())
++        b.finding("compatibility", "medium",
++                  "Free-form query in the source SQL dialect; Sqoop injected $CONDITIONS per mapper.",
++                  ["execution"], ["ingestion.read"], "Confirm the query is pushed down unchanged as a JDBC subquery "
++                  "and that its source-dialect functions are valid there.", source_ref=src_ref, rule="free_form_query")
++    if o.get("--columns"):
++        read["columns"] = [c.strip().lower() for c in o["--columns"].split(",")]
++    b.finding("operational", "low", "Read consistency is unknown: Sqoop mappers read in separate transactions.",
++              [], ["ingestion.read"], "Accept, or require a snapshot/consistent read.", confidence="medium", rule="read_consistency")
++
++    # ---- split
++    mappers = int(o["--num-mappers"]) if o.get("--num-mappers") else 4
++    split = {"split_by": (o.get("--split-by") or "").split(".")[-1].lower() or None, "parallelism": mappers,
++             "lower_bound": None, "upper_bound": None, "bounds_source": "min/max query at run time"}
++    if mappers > 1 and not split["split_by"]:
++        pk = (meta_lookup(obj) or {}).get("primary_key") if obj else None
++        if pk and len(pk) == 1:
++            split["split_by"] = pk[0]
++            split["bounds_source"] = "primary key (Sqoop default)"
++        else:
++            b.finding("configuration", "high", "Parallel read requested without a usable split key.",
++                      ["execution"], ["ingestion.split"], "Set split_by or parallelism 1.", source_ref=src_ref, rule="split_key")
++
++    # ---- load mode and state
++    inc = o.get("--incremental")
++    load = {"mode": "full", "watermark": None, "merge_keys": None, "write_intent": "overwrite_scope_unapproved"}
++    params = []
++    if inc:
++        load["mode"] = "incremental_" + inc
++        load["watermark"] = {"column": (o.get("--check-column") or "").lower() or None,
++                             "last_value_param": "p_last_value", "state_store": "sqoop_saved_job" if job["saved_job"] else "command_line",
++                             "update_rule": "set to the max value read, after a successful write"}
++        params.append({"id": "p_last_value", "name": "last_value", "type": "string", "required": True,
++                       "default": o.get("--last-value"), "binding": "sqoop_saved_job_state" if job["saved_job"] else "command_argument",
++                       "evidence_refs": ["prov_cmd"]})
++        load["write_intent"] = "merge" if inc == "lastmodified" else "append"
++        if o.get("--merge-key"):
++            load["merge_keys"] = [k.strip().lower() for k in o["--merge-key"].split(",")]
++        b.finding("unsupported_logic", "high",
++                  "Incremental '%s' load: the POC supports full imports only, and the current watermark lives in Sqoop's job store." % inc,
++                  ["execution"], ["ingestion.load"], "Keep as a draft; export the saved job's last value and register incremental support.",
++                  source_ref=src_ref, rule="incremental_mode")
++        if inc == "lastmodified" and not load["merge_keys"]:
++            b.finding("configuration", "high", "lastmodified without --merge-key would duplicate changed rows.",
++                      ["execution"], ["ingestion.load"], "Supply merge keys.", source_ref=src_ref, rule="merge_key")
++    else:
++        b.finding("operational", "medium", "Full import: overwrite scope of the target table is not approved.",
++                  ["execution"], ["ingestion.destination"], "Approve full-table replacement of the isolated test table.",
++                  source_ref=src_ref, rule="overwrite_scope")
++
++    # ---- columns from metadata
++    meta = meta_lookup(obj) if obj else (meta_lookup(name) if query_by_name else None)   # query jobs: landed table via Trino
++    columns = []
++    if meta:
++        keep = read["columns"]
++        overrides = {}
++        for opt_name in ("--map-column-hive", "--map-column-java"):
++            for pair in (o.get(opt_name) or "").split(","):
++                if "=" in pair:
++                    c, t = pair.split("=")
++                    overrides[c.strip().lower()] = (t.strip(), opt_name)
++        for c in meta["columns"]:
++            if keep and c["name"] not in keep:
++                continue
++            tgt, note = to_type(c["source_type"])
++            entry = {"source_column": c["name"], "source_type": c["source_type"], "nullable": c["nullable"],
++                     "target_column": c["name"], "target_type": tgt, "mapping_rule": "type_map" if tgt else None}
++            if c["name"] in overrides:
++                entry["target_type"], entry["mapping_rule"] = overrides[c["name"]][0].lower(), overrides[c["name"]][1]
++            if note:
++                entry["note"] = note
++            if any(re.search(p, c["name"]) for p in PII):
++                entry["sensitivity"] = "possible_personal_data"
++            columns.append(entry)
++            if entry["target_type"] is None:
++                b.finding("compatibility", "high", "Column %s: %s." % (c["name"], note), ["execution"],
++                          ["column:%s" % c["name"]], "Cast it in the extraction query or supply a type mapping.", rule="type_map")
++        sens = [c["source_column"] for c in columns if c.get("sensitivity")]
++        if sens:
++            b.finding("privacy", "high", "Column names suggest personal data: %s (names are evidence, not proof)." % ", ".join(sens),
++                      ["execution"], ["column:%s" % s for s in sens],
++                      "Approve a handling policy (destinations, logging, access, required transformations). No masking is applied automatically.",
++                      confidence="medium", rule="pii_names")
++        if any(c["nullable"] is None for c in columns) and meta["origin"].startswith("trino"):
++            b.finding("metadata", "low", "Nullability unknown for some columns.", [], [obj], "Accept as unknown.", rule="nullability")
++    else:
++        b.finding("metadata", "high", "No source metadata for %s: column mappings are unknown." % (obj or "the query result"),
++                  ["generation", "execution"], ["ingestion.column_mappings"],
++                  "Supply the source table definition or the query's result schema.", source_ref=src_ref, rule="metadata_missing")
++
++    # ---- destination (explicit only; never inferred from HDFS paths)
++    landing = {"target_dir": o.get("--target-dir"), "warehouse_dir": o.get("--warehouse-dir"),
++               "hive_database": o.get("--hive-database"), "hive_table": o.get("--hive-table")}
++    destination = {"sqoop_landing": landing, "target_table": {"catalog": opt.target_catalog, "namespace": opt.target_namespace,
++                   "name": name if opt.target_namespace else None, "format": "iceberg", "storage": opt.target_storage}}
++    missing = [k for k in ("catalog", "namespace", "storage") if not destination["target_table"][k]]
++    if missing:
++        b.finding("configuration", "high", "Target %s not supplied (an HDFS landing path does not establish the target)." % ", ".join(missing),
++                  ["generation", "execution"], ["ingestion.destination"], "Supply explicit target settings.", rule="target_explicit")
++
++    # ---- text handling
++    text = {"drop_import_delims": bool(o.get("--hive-drop-import-delims")),
++            "null_string": o.get("--null-string"), "null_non_string": o.get("--null-non-string")}
++
++    # ---- coverage of every option
++    for opt_name in job["order"]:
++        if opt_name in SECRET_OPTS:
++            b.cover(opt_name, "represented", ["connection.authentication"], reason="value redacted")
++        elif opt_name in REPRESENTED:
++            b.cover(opt_name, "represented", [REPRESENTED[opt_name]])
++        elif opt_name in IRRELEVANT:
++            b.cover(opt_name, "irrelevant", reason=IRRELEVANT[opt_name])
++        elif opt_name in FLAGGED:
++            f = b.finding("business_assumption" if opt_name == "--hive-drop-import-delims" else "compatibility", "medium",
++                          FLAGGED[opt_name], ["execution"], ["ingestion"], "Decide and record the target behavior.",
++                          source_ref=src_ref, rule="flag%s" % opt_name.replace("--", "_"))
++            b.cover(opt_name, "unresolved", finding=f)
++        elif opt_name in UNSUPPORTED:
++            f = b.finding("unsupported_logic", "high", "%s: %s." % (opt_name, UNSUPPORTED[opt_name]), ["execution"], ["ingestion"],
++                          "Remove, replace with a supported setting, or exclude the job.", source_ref=src_ref, rule="unsupported_option")
++            b.cover(opt_name, "unsupported", finding=f)
++        else:
++            f = b.finding("unsupported_logic", "medium", "Option %s is not recognised by %s." % (opt_name, RULES_VERSION),
++                          ["execution"], ["ingestion"], "Review manually.", confidence="low", source_ref=src_ref, rule="unknown_option")
++            b.cover(opt_name, "unresolved", finding=f)
++    for k, v in job["connector_args"].items():
++        b.cover("-- --%s" % k, "represented", ["connection.properties"])
++
++    b.finding("configuration", "critical", "No executable sqoop_to_spark schema or capability registry is installed; "
++              "this file is a proposed draft.", ["execution"], [job_id], "Install the contract and registry, then re-validate.",
++              rule="missing_executable_contract")
++
++    return {
++        "contract_family": "sqoop_to_spark",
++        "contract_version": None,
++        "status": "draft",
++        "execution_eligible": False,
++        "project_id": opt.project_id,
++        "job_id": job_id,
++        "revision": 1,
++        "description": "Sqoop %s of %s into an Iceberg table via Spark JDBC." % (direction, obj or "a free-form query"),
++        "source": {
++            "tool": "sqoop", "version": opt.sqoop_version,
++            "files": [{"id": "file_sqoop", "path": sqoop_label, "sha256": file_sha, "locator": "lines %d-%d" % lines}],
++            "saved_job": job["saved_job"], "command_redacted": redact_secrets(" ".join(raw_cmd.split()))[0],
++            "metadata_snapshot": meta["origin"] if meta else None,
++        },
++        "target": {"runtime_family": opt.target_runtime, "table_format": "iceberg", "environment_ref": opt.environment_ref},
++        "connection": connection,
++        "ingestion": {"direction": direction, "read": read, "split": split, "load": load,
++                      "column_mappings": columns, "text_handling": text, "destination": destination},
++        "parameters": params,
++        "dependencies": [{"id": "dep_db", "type": "database", "ref": "conn_source", "objects": [obj] if obj else []}] +
++                        ([{"id": "dep_landing", "type": "hdfs_path", "ref": landing["target_dir"],
++                           "note": "Sqoop landing path; not a target mapping"}] if landing["target_dir"] else []),
++        "provenance": b.prov,
++        "findings": b.findings,
++        "coverage": b.coverage,
++        "versions": {"rules": RULES_VERSION, "skill": opt.skill_ref or default_skill_ref(), "analysis": None, "framework": None},
++        "artifacts": [],
++        "review": {"status": "pending", "decisions": []},
++    }
++
++
++def spec_yaml(spec: dict) -> str:
++    """The YAML text of one job, with a header that says it is a draft and where it came from."""
++    head = ("# Proposed draft, NOT an executable contract (no sqoop_to_spark schema installed yet).\n"
++            "# Generated by agentic.sqoop_yaml (%s) from %s %s.\n" % (RULES_VERSION, os.path.basename(spec["source"]["files"][0]["path"]),
++                                                                     spec["source"]["files"][0]["locator"]))
++    return head + yaml.safe_dump(spec, sort_keys=False, allow_unicode=True, width=110, default_flow_style=False)
++
++
++def build_specs(sqoop: Source, ddl: Optional[Source] = None, options: Optional[Options] = None,
++                trino_url: Optional[str] = None, trino_schema: Optional[str] = None) -> dict:
++    """All job specs of a Sqoop file, without writing anything. -> {"specs": [...], "skipped": [...], "warnings": [...]}"""
++    if ddl and trino_url:
++        raise ValueError("give either DDL or a Trino URL for the source metadata, not both")
++    opt = options or Options()
++    tables = source_ddl_tables(ddl.code, os.path.basename(ddl.label)) if ddl else {}
++    warnings: List[str] = []
++
++    def lookup(obj):
++        if not obj:
++            return None
++        if trino_url:
++            if not trino_schema and obj.count(".") != 2:
++                warnings.append("Trino needs a schema (catalog.schema) to find %s; mappings left unknown" % obj)
++                return None
++            fq = obj if obj.count(".") == 2 else "%s.%s" % (trino_schema, obj.split(".")[-1])
++            try:
++                return trino_table(trino_url, fq)
++            except Exception as e:                       # a failed lookup is an unknown, never a crash
++                warnings.append("Trino lookup of %s failed (%s); mappings left unknown" % (fq, str(e).splitlines()[0][:120]))
++                return None
++        key = obj.lower()
++        if key in tables:
++            return tables[key]
++        hits = [k for k in tables if k.split(".")[-1] == key.split(".")[-1]]
++        return tables[hits[0]] if len(hits) == 1 else None
++
++    sha = hashlib.sha256(sqoop.code.encode("utf-8")).hexdigest()
++    specs, skipped, seen = [], [], set()
++    for lines, cmd in read_commands(sqoop.code):
++        try:
++            job = parse(cmd)
++        except ValueError as e:                          # unbalanced quotes
++            warnings.append("lines %d-%d: cannot read the command (%s)" % (lines[0], lines[1], e))
++            skipped.append(lines[0])
++            continue
++        if not job["tool"]:
++            warnings.append("line %d: not a Sqoop tool invocation; skipped" % lines[0])
++            skipped.append(lines[0])
++            continue
++        spec = build(job, lines, cmd, sqoop.label, opt, lookup, sha, query_by_name=bool(trino_url))
++        if spec["job_id"] in seen:                       # two commands landing in the same place: keep both files
++            n = 2
++            while "%s_%d" % (spec["job_id"], n) in seen:
++                n += 1
++            warnings.append("lines %d-%d: job id %s is already used; this job is %s_%d"
++                            % (lines[0], lines[1], spec["job_id"], spec["job_id"], n))
++            spec["job_id"] = "%s_%d" % (spec["job_id"], n)
++        seen.add(spec["job_id"])
++        specs.append(spec)
++    return {"specs": specs, "skipped": skipped, "warnings": warnings}
++
++
++# ---------- summary ----------
++
++def build_report(label: str, specs: List[dict], skipped: List[int], warnings: List[str]) -> dict:
++    jobs, findings, coverage = [], [], []
++    for s in specs:
++        blocking = [f for f in s["findings"] if "execution" in f["blocks"]]
++        jobs.append({"job_id": s["job_id"], "lines": s["source"]["files"][0]["locator"],
++                     "saved_job": s["source"]["saved_job"], "load_mode": s["ingestion"]["load"]["mode"],
++                     "source": s["ingestion"]["read"]["table"] or "query",
++                     "columns": len(s["ingestion"]["column_mappings"]),
++                     "findings": len(s["findings"]), "blocking_execution": len(blocking)})
++        for f in s["findings"]:
++            findings.append({"job": s["job_id"], "id": f["id"].split(".")[-1], "category": f["category"],
++                             "severity": f["severity"], "blocks": ",".join(f["blocks"]) or "-",
++                             "evidence": f["evidence"], "resolution": f["resolution"]})
++        for c in s["coverage"]:
++            coverage.append({"job": s["job_id"], "construct": c["construct"], "status": c["status"],
++                             "detail": (c.get("refs") or c.get("finding_refs") or [c.get("reason", "")])[0]})
++    full = sum(1 for j in jobs if j["load_mode"] == "full")
++    return {
++        "sqoop_file": label,
++        "summary": {"jobs": len(jobs), "full": full, "incremental": len(jobs) - full,
++                    "findings": len(findings), "blocking_execution": sum(j["blocking_execution"] for j in jobs),
++                    "skipped_lines": skipped},
++        "jobs": jobs,
++        "findings": findings,
++        "coverage": coverage,
++        "warnings": warnings,
++    }
++
++
++def _cell(text) -> str:
++    return str(text).replace("|", "\\|").replace("\n", " ")
++
++
++def to_markdown(r: dict, yaml_names: Dict[str, str]) -> str:
++    s = r["summary"]
++    out = ["# Sqoop jobs to YAML: %s" % r["sqoop_file"], "",
++           "Jobs: **%d** (%d full, %d incremental). Findings: **%d**, %d of them block execution."
++           % (s["jobs"], s["full"], s["incremental"], s["findings"], s["blocking_execution"]), "",
++           "Every file is a proposed draft (`execution_eligible: false`) until a `sqoop_to_spark` schema and capability "
++           "registry are installed and the findings are reviewed.", ""]
++    if r["warnings"]:
++        out += ["## Warnings", ""] + ["- %s" % w for w in r["warnings"]] + [""]
++    out += ["## Jobs", "",
++            "| Job | Lines | Load mode | Source | Columns mapped | Findings | Blocking execution | YAML |",
++            "|---|---|---|---|---:|---:|---:|---|"]
++    for j in r["jobs"]:
++        out.append("| %s | %s | %s | %s | %d | %d | %d | `%s` |" % (j["job_id"], j["lines"], j["load_mode"], _cell(j["source"]),
++                                                               j["columns"], j["findings"], j["blocking_execution"],
++                                                               yaml_names.get(j["job_id"], "")))
++    out += ["", "## Findings", "", "| Job | Id | Category | Severity | Blocks | Evidence |", "|---|---|---|---|---|---|"]
++    for f in r["findings"]:
++        out.append("| %s | %s | %s | %s | %s | %s |" % (f["job"], f["id"], f["category"], f["severity"], f["blocks"],
++                                                       _cell(f["evidence"])))
++    out += ["", "## Coverage: how every Sqoop option was handled", "",
++            "| Job | Option | Status | YAML path, finding or reason |", "|---|---|---|---|"]
++    for c in r["coverage"]:
++        out.append("| %s | `%s` | %s | %s |" % (c["job"], c["construct"], c["status"], _cell(c["detail"])))
++    out.append("")
++    return "\n".join(out)
++
++
++# ---------- output ----------
++
++def convert(sqoop: Source, ddl: Optional[Source] = None, options: Optional[Options] = None,
++            trino_url: Optional[str] = None, trino_schema: Optional[str] = None,
++            out_base: Optional[str] = None, now=None) -> dict:
++    """Build every job's YAML and write them, with the Markdown and JSON summary, into a new run folder."""
++    built = build_specs(sqoop, ddl, options, trino_url, trino_schema)
++    report = build_report(sqoop.label, built["specs"], built["skipped"], built["warnings"])
++    folder, stamp = new_run_dir(out_base or ui_settings()["out_dir"], stamp_now(now), name=safe_stem(sqoop.label))
++    yaml_names = {s["job_id"]: out_name(s["job_id"], stamp, "yaml") for s in built["specs"]}
++    texts = {s["job_id"]: spec_yaml(s) for s in built["specs"]}
++    paths = {"yaml": {j: os.path.join(folder, n) for j, n in yaml_names.items()},
++             "markdown": os.path.join(folder, out_name("sqoop_yaml", stamp, "md")),
++             "json": os.path.join(folder, out_name("sqoop_yaml", stamp, "json"))}
++    report["stamp"] = stamp
++    for job_id, path in paths["yaml"].items():
++        with open(path, "w", encoding="utf-8") as fh:
++            fh.write(texts[job_id])
++    markdown = to_markdown(report, yaml_names)
++    with open(paths["markdown"], "w", encoding="utf-8") as fh:
++        fh.write(markdown)
++    with open(paths["json"], "w", encoding="utf-8") as fh:
++        json.dump(report, fh, indent=2)
++    return {"folder": folder, "files": paths, "report": report, "markdown": markdown, "yaml": texts}
++
++
++def main(argv=None) -> int:
++    ap = argparse.ArgumentParser(prog="agentic.sqoop_yaml", description="Turn Sqoop jobs into intermediate YAML files")
++    ap.add_argument("sqoop_file", help="text file of Sqoop commands")
++    meta = ap.add_mutually_exclusive_group()
++    meta.add_argument("--ddl", help="CREATE TABLE statements of the source database")
++    meta.add_argument("--trino", help="Trino URL to read table metadata (use with --trino-schema)")
++    ap.add_argument("--trino-schema", help="catalog.schema in Trino that holds the tables, e.g. hive.sqoop_poc_spark "
++                                          "(the Sqoop-landed copies)")
++    d = Options()
++    ap.add_argument("--project-id", default=d.project_id)
++    ap.add_argument("--sqoop-version", default=d.sqoop_version)
++    ap.add_argument("--target-runtime", default=d.target_runtime)
++    ap.add_argument("--target-catalog")
++    ap.add_argument("--target-namespace")
++    ap.add_argument("--target-storage")
++    ap.add_argument("--environment-ref")
++    ap.add_argument("--skill-ref", help="default: agentic/skills/sqoop-to-spark@<hash of its SKILL.md>")
++    ap.add_argument("--out", default=None, help="output folder (default: ui.out_dir in config.yaml)")
++    a = ap.parse_args(argv)
++    opt = Options(a.project_id, a.sqoop_version, a.target_runtime, a.target_catalog, a.target_namespace,
++                  a.target_storage, a.environment_ref, a.skill_ref)
++    try:
++        res = convert(load_source(path=a.sqoop_file, name=a.sqoop_file), load_source(path=a.ddl) if a.ddl else None,
++                      opt, a.trino, a.trino_schema, a.out)
++    except (OSError, ValueError) as e:
++        print(f"ERROR: {type(e).__name__}: {e}", file=sys.stderr)
++        return 2
++    for w in res["report"]["warnings"]:
++        print("note:", w)
++    for j in res["report"]["jobs"]:
++        print("%-34s %-26s findings=%d (blocking execution: %d)" % (os.path.basename(res["files"]["yaml"][j["job_id"]]),
++                                                                   j["load_mode"], j["findings"], j["blocking_execution"]))
++    print(f"Files written to {res['folder']}/")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/samples/sqoop_jobs.txt b/samples/sqoop_jobs.txt
+new file mode 100644
+index 0000000..aff4e49
+--- /dev/null
++++ b/samples/sqoop_jobs.txt
+@@ -0,0 +1,36 @@
++# Sqoop jobs from the Sqoop POC notebook (sections 4 and 5), written out as plain commands.
++# Postgres host: use the one your Sqoop actually connects to (172.16.0.4 internally, 172.171.240.8 externally).
++
++# ---- full loads (section 4)
++sqoop import --connect jdbc:postgresql://172.16.0.4:5432/sourcedb --username postgres --password-file /user/jovyan/.pg_sqoop.pw \
++  --fields-terminated-by '\001' --lines-terminated-by '\n' --null-string '\\N' --null-non-string '\\N' --hive-drop-import-delims \
++  --target-dir /data/sqoop_poc/raw/branches -m 1 --table branches -- --schema retail
++
++sqoop import --connect jdbc:postgresql://172.16.0.4:5432/sourcedb --username postgres --password-file /user/jovyan/.pg_sqoop.pw \
++  --fields-terminated-by '\001' --lines-terminated-by '\n' --null-string '\\N' --null-non-string '\\N' --hive-drop-import-delims \
++  --target-dir /data/sqoop_poc/raw/customers -m 4 --split-by c.customer_id \
++  --query "SELECT c.customer_id, c.customer_ref, c.full_name, c.email, c.segment::text AS segment, c.country, c.kyc_status, c.pep_flag, c.date_of_birth, c.onboard_ts, c.address::text AS address_json, array_to_string(c.tags, '|') AS tags, c.notes, c.updated_at FROM retail.customers c WHERE \$CONDITIONS"
++
++sqoop import --connect jdbc:postgresql://172.16.0.4:5432/sourcedb --username postgres --password-file /user/jovyan/.pg_sqoop.pw \
++  --fields-terminated-by '\001' --lines-terminated-by '\n' --null-string '\\N' --null-non-string '\\N' --hive-drop-import-delims \
++  --target-dir /data/sqoop_poc/raw/account_holders -m 4 --table account_holders --split-by account_id -- --schema retail
++
++sqoop import --connect jdbc:postgresql://172.16.0.4:5432/sourcedb --username postgres --password-file /user/jovyan/.pg_sqoop.pw \
++  --fields-terminated-by '\001' --lines-terminated-by '\n' --null-string '\\N' --null-non-string '\\N' --hive-drop-import-delims \
++  --target-dir /data/sqoop_poc/raw/fx_rates_log -m 1 --table fx_rates_log --autoreset-to-one-mapper -- --schema retail
++
++sqoop import --connect jdbc:postgresql://172.16.0.4:5432/sourcedb --username postgres --password-file /user/jovyan/.pg_sqoop.pw \
++  --fields-terminated-by '\001' --lines-terminated-by '\n' --null-string '\\N' --null-non-string '\\N' --hive-drop-import-delims \
++  --target-dir /data/sqoop_poc/raw/acct_enriched -m 4 --split-by a.account_id \
++  --query "SELECT a.account_id, a.account_no, c.customer_ref, c.full_name, c.segment::text AS segment, a.account_type, a.currency, a.balance, a.branch_code, b.branch_name, b.city, a.status FROM retail.accounts a JOIN retail.customers c ON c.customer_id = a.customer_id LEFT JOIN retail.branches b ON b.branch_code = a.branch_code WHERE \$CONDITIONS"
++
++# ---- incremental saved jobs (section 5)
++sqoop job --create poc_transactions_append -- import --connect jdbc:postgresql://172.16.0.4:5432/sourcedb --username postgres --password-file /user/jovyan/.pg_sqoop.pw \
++  --fields-terminated-by '\001' --lines-terminated-by '\n' --null-string '\\N' --null-non-string '\\N' --hive-drop-import-delims \
++  --table transactions --target-dir /data/sqoop_poc/raw/transactions --split-by txn_id -m 8 \
++  --incremental append --check-column txn_id --last-value 0 -- --schema retail
++
++sqoop job --create poc_accounts_lastmodified -- import --connect jdbc:postgresql://172.16.0.4:5432/sourcedb --username postgres --password-file /user/jovyan/.pg_sqoop.pw \
++  --fields-terminated-by '\001' --lines-terminated-by '\n' --null-string '\\N' --null-non-string '\\N' --hive-drop-import-delims \
++  --table accounts --target-dir /data/sqoop_poc/raw/accounts --split-by account_id -m 4 \
++  --incremental lastmodified --check-column updated_at --last-value "1970-01-01 00:00:00" --merge-key account_id -- --schema retail
+diff --git a/sqoop_poc/sqoop_postgres_to_hive_poc.ipynb b/sqoop_poc/sqoop_postgres_to_hive_poc.ipynb
+new file mode 100644
+index 0000000..d97b3bb
+--- /dev/null
++++ b/sqoop_poc/sqoop_postgres_to_hive_poc.ipynb
+@@ -0,0 +1,734 @@
++{
++ "cells": [
++  {
++   "cell_type": "markdown",
++   "id": "d38b34b7",
++   "metadata": {},
++   "source": [
++    "# Sqoop:Postgres -> HDFS -> Hive (browse in Hue)\n",
++    "\n",
++    "What this notebook does, in order:\n",
++    "\n",
++    "1. **Create the source**: a `retail` schema in Postgres with 6 deliberately awkward tables and generated data (SQL files in `sql/`).\n",
++    "2. **Run Sqoop jobs** that pull those tables into HDFS: full loads, a free-form join query, an **append** incremental job and a **lastmodified + merge** incremental job.\n",
++    "3. **Register Hive tables** over the landed files (`sqoop_poc.stg_*`), then write curated Parquet copies (`sqoop_poc.*`).\n",
++    "4. **Validate** Postgres vs Hive (row counts, sums, null counts).\n",
++    "5. **Simulate a day of changes** in Postgres, rerun the incremental jobs, validate again.\n",
++    "6. Optional: a **Spark JDBC fallback** if Sqoop is not installed on the machine running the notebook.\n",
++    "\n",
++    "Where to see the result in Hue: **File Browser** -> `/data/sqoop_poc/raw/` and the **Hive editor** -> database `sqoop_poc`.\n",
++    "\n",
++    "The notebook machine needs: network access to Postgres, and the `sqoop`, `hdfs` commands on PATH (sections 3-5). Section 1 needs only Python."
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "id": "fdd7fabd",
++   "metadata": {},
++   "source": [
++    "## 0. Configuration (edit this cell)"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "id": "8721bbda-38d2-4dd2-b16c-afdb4f007f81",
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "import os, sys\n",
++    "# ignore the old Spark 3.5.0 in /usr/local/spark\n",
++    "sys.path = [p for p in sys.path if not p.startswith(\"/usr/local/spark\")]\n",
++    "import pyspark\n",
++    "os.environ[\"SPARK_HOME\"] = os.path.dirname(pyspark.__file__)\n",
++    "print(\"PySpark\", pyspark.__version__, \"from\", os.environ[\"SPARK_HOME\"])"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "id": "da6188ac",
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "import os, sys, subprocess, shlex, time\n",
++    "\n",
++    "# ---- Postgres (source). Override with environment variables if you prefer.\n",
++    "from getpass import getpass\n",
++    "\n",
++    "PG = dict(\n",
++    "    host=\"172.16.0.4\",\n",
++    "    port=5432,\n",
++    "    dbname=\"sourcedb\",\n",
++    "    user=\"postgres\",\n",
++    "    password=os.getenv(\"PG_PASSWORD\") or getpass(\"Postgres password: \"),   # never commit a password\n",
++    "    connect_timeout=10,\n",
++    ")\n",
++    "PG_SCHEMA = \"retail\"\n",
++    "JDBC_URL = \"jdbc:postgresql://{host}:{port}/{dbname}\".format(**PG)\n",
++    "\n",
++    "\n",
++    "\n",
++    "# ---- Hadoop / Hive (target)\n",
++    "HDFS_URI = \"hdfs://172.16.0.4:9000\"\n",
++    "HDFS_USER = os.getenv(\"HADOOP_USER_NAME\", os.getenv(\"USER\", \"hadoop\"))\n",
++    "RAW_BASE = \"/data/sqoop_poc/raw\"                       # where Sqoop lands the files\n",
++    "PW_FILE = \"/user/%s/.pg_sqoop.pw\" % HDFS_USER          # Sqoop password file (HDFS, mode 400)\n",
++    "HIVE_DB = \"sqoop_poc\"\n",
++    "\n",
++    "# ---- Tools\n",
++    "SQL_DIR = \".\"\n",
++    "SQOOP_BIN = os.getenv(\"SQOOP_BIN\", \"sqoop\")\n",
++    "HDFS_BIN = os.getenv(\"HDFS_BIN\", \"hdfs\")\n",
++    "\n",
++    "# True  -> use Sqoop (sections 3-5);  False -> skip them and use the Spark JDBC fallback (section 8)\n",
++    "USE_SQOOP = False\n",
++    "\n",
++    "print(\"JDBC URL :\", JDBC_URL)\n",
++    "print(\"HDFS raw :\", HDFS_URI + RAW_BASE)"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "id": "c4ec4add",
++   "metadata": {},
++   "source": [
++    "###### 1. Create the Postgres source (schema + data)\n",
++    "\n",
++    "Tables and what makes each one tricky for an import:\n",
++    "\n",
++    "| Table | Rows | Complexity |\n",
++    "|---|---|---|\n",
++    "| `branches` | 40 | small dimension, boolean, char(2) |\n",
++    "| `customers` | 10,000 | enum, JSONB, text[] array, timestamptz, nullable columns, notes with commas / quotes / newlines / tabs / unicode |\n",
++    "| `accounts` | 15,000 | FK to customers + branches, signed NUMERIC(18,2), nullable `close_date` / `credit_limit`, `updated_at` for lastmodified loads |\n",
++    "| `account_holders` | ~18,000 | **composite primary key** (many-to-many) |\n",
++    "| `transactions` | 200,000 | big table for parallel mappers, outliers and zero amounts, memo text with delimiters, `txn_id` for append loads |\n",
++    "| `fx_rates_log` | ~980 | **no primary key**, contains duplicate rows |"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "id": "c074be9f",
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "subprocess.check_call([sys.executable, \"-m\", \"pip\", \"install\", \"-q\", \"psycopg2-binary\"])\n",
++    "import psycopg2\n",
++    "\n",
++    "\n",
++    "def pg_connect(dbname=None, autocommit=False):\n",
++    "    cfg = dict(PG)\n",
++    "    if dbname:\n",
++    "        cfg[\"dbname\"] = dbname\n",
++    "    conn = psycopg2.connect(**cfg)\n",
++    "    conn.autocommit = autocommit\n",
++    "    return conn\n",
++    "\n",
++    "\n",
++    "def pg_query(sql, params=None):\n",
++    "    conn = pg_connect()\n",
++    "    try:\n",
++    "        with conn.cursor() as cur:\n",
++    "            cur.execute(sql, params)\n",
++    "            return cur.fetchall()\n",
++    "    finally:\n",
++    "        conn.close()\n",
++    "\n",
++    "\n",
++    "def run_sql_file(name):\n",
++    "    with open(os.path.join(SQL_DIR, name), encoding=\"utf-8\") as f:\n",
++    "        sql = f.read()\n",
++    "    conn = pg_connect()\n",
++    "    try:\n",
++    "        with conn.cursor() as cur:\n",
++    "            cur.execute(sql)\n",
++    "        conn.commit()\n",
++    "    finally:\n",
++    "        conn.close()\n",
++    "    print(\"ran\", name)\n",
++    "\n",
++    "\n",
++    "# create the database if it does not exist\n",
++    "admin = pg_connect(dbname=\"postgres\", autocommit=True)\n",
++    "with admin.cursor() as cur:\n",
++    "    cur.execute(\"SELECT 1 FROM pg_database WHERE datname = %s\", (PG[\"dbname\"],))\n",
++    "    if not cur.fetchone():\n",
++    "        cur.execute('CREATE DATABASE \"%s\"' % PG[\"dbname\"])\n",
++    "        print(\"created database\", PG[\"dbname\"])\n",
++    "admin.close()\n",
++    "\n",
++    "run_sql_file(\"01_schema.sql\")\n",
++    "run_sql_file(\"02_data.sql\")"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "id": "153e9014",
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "# Check what was generated, including the awkward data\n",
++    "checks = {\n",
++    "    \"branches\": \"SELECT count(*) FROM retail.branches\",\n",
++    "    \"customers\": \"SELECT count(*) FROM retail.customers\",\n",
++    "    \"accounts\": \"SELECT count(*) FROM retail.accounts\",\n",
++    "    \"account_holders\": \"SELECT count(*) FROM retail.account_holders\",\n",
++    "    \"transactions\": \"SELECT count(*) FROM retail.transactions\",\n",
++    "    \"fx_rates_log\": \"SELECT count(*) FROM retail.fx_rates_log\",\n",
++    "    \"customers with NULL email\": \"SELECT count(*) FROM retail.customers WHERE email IS NULL\",\n",
++    "    \"customers whose notes contain a newline\": r\"SELECT count(*) FROM retail.customers WHERE notes LIKE E'%\\n%'\",\n",
++    "    \"customers with empty tags array\": \"SELECT count(*) FROM retail.customers WHERE tags = '{}'\",\n",
++    "    \"accounts with negative balance\": \"SELECT count(*) FROM retail.accounts WHERE balance < 0\",\n",
++    "    \"fx duplicate (date, currency) groups\": \"SELECT count(*) FROM (SELECT 1 FROM retail.fx_rates_log GROUP BY rate_date, currency HAVING count(*) > 1) d\",\n",
++    "}\n",
++    "for label, q in checks.items():\n",
++    "    print(\"%-42s %s\" % (label, pg_query(q)[0][0]))"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "id": "da6fad5e",
++   "metadata": {},
++   "source": [
++    "## 2. Spark session (used to register Hive tables and to validate)\n",
++    "Same configuration as your working notebook, plus the Postgres JDBC driver for the optional fallback."
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "id": "58e1303a",
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "from pyspark.sql import SparkSession, functions as F\n",
++    "\n",
++    "spark = (\n",
++    "    SparkSession.builder\n",
++    "    .appName(\"Sqoop-POC\")\n",
++    "    .config(\"spark.sql.catalogImplementation\", \"hive\")\n",
++    "    .master(\"spark://spark-master:7077\")\n",
++    "    #.master(\"local[*]\")\n",
++    "    .config(\"spark.hadoop.fs.defaultFS\", HDFS_URI)\n",
++    "    .config(\"spark.sql.warehouse.dir\", HDFS_URI + \"/user/hive/warehouse\")\n",
++    "    .config(\"hive.metastore.uris\", \"thrift://172.16.0.4:9083\")\n",
++    "    #.config(\"spark.sql.hive.metastore.version\", \"4.1.0\")\n",
++    "    .config(\"spark.sql.hive.metastore.version\", \"3.1.3\")\n",
++    "    .config(\"spark.sql.hive.metastore.jars\", \"maven\")\n",
++    "    .config(\"spark.cores.max\", \"2\")\n",
++    "    .config(\"spark.jars.packages\", \"org.postgresql:postgresql:42.7.3\")\n",
++    "    .enableHiveSupport()\n",
++    "    .getOrCreate()\n",
++    ")\n",
++    "print(\"Spark\", spark.version, \"| master:\", spark.sparkContext.master)"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "id": "1c4dad44",
++   "metadata": {},
++   "source": [
++    "## 3. Sqoop: prerequisites and helpers\n",
++    "Checks the tools exist and stores the Postgres password in a protected HDFS file (so it is never on a command line or in a saved job)."
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "id": "a2a12bff",
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "def sh(cmd, check=True, input_text=None, show_tail=12):\n",
++    "    \"\"\"Run a command, keep the output, print a short tail (or everything on failure).\"\"\"\n",
++    "    print(\"$\", \" \".join(shlex.quote(c) for c in cmd))\n",
++    "    p = subprocess.Popen(cmd, stdin=subprocess.PIPE if input_text is not None else None,\n",
++    "                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)\n",
++    "    out, _ = p.communicate(input_text)\n",
++    "    lines = out.splitlines()\n",
++    "    if p.returncode != 0:\n",
++    "        print(\"\\n\".join(lines[-80:]))\n",
++    "        if check:\n",
++    "            raise RuntimeError(\"command failed (exit %d): %s\" % (p.returncode, cmd[0]))\n",
++    "    elif show_tail:\n",
++    "        print(\"\\n\".join(lines[-show_tail:]))\n",
++    "    return out\n",
++    "\n",
++    "\n",
++    "def hdfs(*args, **kw):\n",
++    "    return sh([HDFS_BIN, \"dfs\"] + list(args), **kw)\n",
++    "\n",
++    "\n",
++    "if USE_SQOOP:\n",
++    "    for tool in (SQOOP_BIN, HDFS_BIN):\n",
++    "        found = subprocess.call([\"which\", tool], stdout=subprocess.DEVNULL) == 0\n",
++    "        print(\"%-8s %s\" % (tool, \"found\" if found else \"NOT FOUND on PATH (set SQOOP_BIN/HDFS_BIN or use the Spark JDBC fallback in section 8)\"))\n",
++    "\n",
++    "    hdfs(\"-mkdir\", \"-p\", RAW_BASE, \"/user/%s\" % HDFS_USER, show_tail=0)\n",
++    "    hdfs(\"-rm\", \"-f\", PW_FILE, check=False, show_tail=0)\n",
++    "    sh([HDFS_BIN, \"dfs\", \"-put\", \"-\", PW_FILE], input_text=PG[\"password\"], show_tail=0)   # no trailing newline\n",
++    "    hdfs(\"-chmod\", \"400\", PW_FILE, show_tail=0)\n",
++    "    print(\"password file:\", PW_FILE)\n",
++    "    # Reminder: the Postgres JDBC jar must be in $SQOOP_HOME/lib (e.g. postgresql-42.x.jar)"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "id": "0406db21",
++   "metadata": {},
++   "source": [
++    "### Shared Sqoop options\n",
++    "* `--fields-terminated-by '\\001'` (Hive's default delimiter) and `--null-string '\\\\N'`: so NULL stays NULL and is not confused with an empty string.\n",
++    "* `--hive-drop-import-delims`: strips `\\n`, `\\r`, `\\001` from string columns. The `notes` and `memo` columns contain newlines and tabs on purpose; without this a text row would break into several lines."
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "id": "6b7a5930",
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "COMMON = [\n",
++    "    \"--connect\", JDBC_URL,\n",
++    "    \"--username\", PG[\"user\"],\n",
++    "    \"--password-file\", PW_FILE,\n",
++    "    \"--fields-terminated-by\", \"\\\\001\",\n",
++    "    \"--lines-terminated-by\", \"\\\\n\",\n",
++    "    \"--null-string\", \"\\\\\\\\N\",\n",
++    "    \"--null-non-string\", \"\\\\\\\\N\",\n",
++    "    \"--hive-drop-import-delims\",\n",
++    "]\n",
++    "SCHEMA_ARGS = [\"--\", \"--schema\", PG_SCHEMA]      # Postgres connector argument: tables live in schema \"retail\"\n",
++    "\n",
++    "\n",
++    "def target(name):\n",
++    "    return \"%s/%s\" % (RAW_BASE, name)\n",
++    "\n",
++    "\n",
++    "def sqoop_import(name, extra, mappers):\n",
++    "    \"\"\"Full (re)load: wipe the target dir, then run `sqoop import`.\"\"\"\n",
++    "    hdfs(\"-rm\", \"-r\", \"-f\", \"-skipTrash\", target(name), check=False, show_tail=0)\n",
++    "    cmd = [SQOOP_BIN, \"import\"] + COMMON + [\"--target-dir\", target(name), \"-m\", str(mappers)] + extra\n",
++    "    return sh(cmd)"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "id": "2922904c",
++   "metadata": {},
++   "source": [
++    "## 4. Sqoop: full loads\n",
++    "\n",
++    "| Job | Technique |\n",
++    "|---|---|\n",
++    "| `branches` | plain `--table`, 1 mapper |\n",
++    "| `customers` | **free-form `--query`** with casts: the enum (`::text`), JSONB (`::text`) and array (`array_to_string`) cannot be imported directly; 4 parallel mappers via `--split-by` |\n",
++    "| `account_holders` | composite PK, so `--split-by account_id` is required for parallel mappers |\n",
++    "| `fx_rates_log` | no PK and duplicates, so a single mapper (`--autoreset-to-one-mapper`) |\n",
++    "| `acct_enriched` | **free-form join** of accounts + customers + branches |"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "id": "f27a0593",
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "CUSTOMERS_QUERY = \"\"\"\n",
++    "SELECT c.customer_id, c.customer_ref, c.full_name, c.email,\n",
++    "       c.segment::text                    AS segment,\n",
++    "       c.country, c.kyc_status, c.pep_flag, c.date_of_birth, c.onboard_ts,\n",
++    "       c.address::text                    AS address_json,\n",
++    "       array_to_string(c.tags, '|')       AS tags,\n",
++    "       c.notes, c.updated_at\n",
++    "FROM retail.customers c\n",
++    "WHERE $CONDITIONS\n",
++    "\"\"\"\n",
++    "\n",
++    "ENRICHED_QUERY = \"\"\"\n",
++    "SELECT a.account_id, a.account_no, c.customer_ref, c.full_name,\n",
++    "       c.segment::text AS segment, a.account_type, a.currency, a.balance,\n",
++    "       a.branch_code, b.branch_name, b.city, a.status\n",
++    "FROM retail.accounts a\n",
++    "JOIN retail.customers c ON c.customer_id = a.customer_id\n",
++    "LEFT JOIN retail.branches b ON b.branch_code = a.branch_code\n",
++    "WHERE $CONDITIONS\n",
++    "\"\"\"\n",
++    "\n",
++    "if USE_SQOOP:\n",
++    "    sqoop_import(\"branches\", [\"--table\", \"branches\"] + SCHEMA_ARGS, 1)\n",
++    "\n",
++    "    sqoop_import(\"customers\", [\"--query\", CUSTOMERS_QUERY, \"--split-by\", \"c.customer_id\"], 4)\n",
++    "\n",
++    "    sqoop_import(\"account_holders\",\n",
++    "                 [\"--table\", \"account_holders\", \"--split-by\", \"account_id\"] + SCHEMA_ARGS, 4)\n",
++    "\n",
++    "    sqoop_import(\"fx_rates_log\",\n",
++    "                 [\"--table\", \"fx_rates_log\", \"--autoreset-to-one-mapper\"] + SCHEMA_ARGS, 1)\n",
++    "\n",
++    "    sqoop_import(\"acct_enriched\", [\"--query\", ENRICHED_QUERY, \"--split-by\", \"a.account_id\"], 4)"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "id": "1be8c616",
++   "metadata": {},
++   "source": [
++    "## 5. Sqoop: incremental loads as saved jobs\n",
++    "A saved job remembers the last value, so each run only moves new data.\n",
++    "\n",
++    "* `transactions` : `--incremental append` on `txn_id` (new rows only, 8 parallel mappers).\n",
++    "* `accounts` : `--incremental lastmodified` on `updated_at` with `--merge-key account_id` (changed rows replace the old version, new rows are added)."
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "id": "e1b0b051",
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "def create_saved_job(job_name, import_args):\n",
++    "    sh([SQOOP_BIN, \"job\", \"--delete\", job_name], check=False, show_tail=0)\n",
++    "    sh([SQOOP_BIN, \"job\", \"--create\", job_name, \"--\", \"import\"] + import_args, show_tail=3)\n",
++    "\n",
++    "\n",
++    "def exec_saved_job(job_name):\n",
++    "    return sh([SQOOP_BIN, \"job\", \"--exec\", job_name], show_tail=15)\n",
++    "\n",
++    "\n",
++    "TX_JOB = [\n",
++    "    \"--table\", \"transactions\", \"--target-dir\", target(\"transactions\"),\n",
++    "    \"--split-by\", \"txn_id\", \"-m\", \"8\",\n",
++    "    \"--incremental\", \"append\", \"--check-column\", \"txn_id\", \"--last-value\", \"0\",\n",
++    "] + SCHEMA_ARGS\n",
++    "\n",
++    "ACCT_JOB = [\n",
++    "    \"--table\", \"accounts\", \"--target-dir\", target(\"accounts\"),\n",
++    "    \"--split-by\", \"account_id\", \"-m\", \"4\",\n",
++    "    \"--incremental\", \"lastmodified\", \"--check-column\", \"updated_at\",\n",
++    "    \"--last-value\", \"1970-01-01 00:00:00\", \"--merge-key\", \"account_id\",\n",
++    "] + SCHEMA_ARGS\n",
++    "\n",
++    "if USE_SQOOP:\n",
++    "    hdfs(\"-rm\", \"-r\", \"-f\", \"-skipTrash\", target(\"transactions\"), target(\"accounts\"), check=False, show_tail=0)\n",
++    "    create_saved_job(\"poc_transactions_append\", COMMON + TX_JOB)\n",
++    "    create_saved_job(\"poc_accounts_lastmodified\", COMMON + ACCT_JOB)\n",
++    "    exec_saved_job(\"poc_transactions_append\")      # initial load: all 200,000 rows\n",
++    "    exec_saved_job(\"poc_accounts_lastmodified\")    # initial load: all 15,000 rows"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "id": "d6863daa",
++   "metadata": {},
++   "source": [
++    "Look at what Sqoop landed (this is also what you will see in Hue's File Browser):"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "id": "a85afe7c",
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "if USE_SQOOP:\n",
++    "    hdfs(\"-ls\", \"-R\", RAW_BASE, show_tail=60)\n",
++    "    hdfs(\"-du\", \"-h\", RAW_BASE, show_tail=20)"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "id": "dc3d685c",
++   "metadata": {},
++   "source": [
++    "## 6. Register Hive tables over the landed files, then write curated Parquet\n",
++    "\n",
++    "* `sqoop_poc.stg_<table>`: **external** text tables, exactly the files Sqoop wrote (so the incremental loads show up automatically).\n",
++    "* `sqoop_poc.<table>`: curated **Parquet** copies. `transactions` is joined to accounts (adds `customer_id`, `currency`) and **partitioned by `txn_date`**."
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "id": "f7839886",
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "HIVE_COLS = {\n",
++    "    \"branches\": [(\"branch_code\", \"string\"), (\"branch_name\", \"string\"), (\"city\", \"string\"),\n",
++    "                 (\"state_code\", \"string\"), (\"opened_date\", \"date\"), (\"is_active\", \"boolean\")],\n",
++    "    \"customers\": [(\"customer_id\", \"bigint\"), (\"customer_ref\", \"string\"), (\"full_name\", \"string\"),\n",
++    "                  (\"email\", \"string\"), (\"segment\", \"string\"), (\"country\", \"string\"),\n",
++    "                  (\"kyc_status\", \"string\"), (\"pep_flag\", \"boolean\"), (\"date_of_birth\", \"date\"),\n",
++    "                  (\"onboard_ts\", \"timestamp\"), (\"address_json\", \"string\"), (\"tags\", \"string\"),\n",
++    "                  (\"notes\", \"string\"), (\"updated_at\", \"timestamp\")],\n",
++    "    \"accounts\": [(\"account_id\", \"bigint\"), (\"account_no\", \"string\"), (\"customer_id\", \"bigint\"),\n",
++    "                 (\"account_type\", \"string\"), (\"currency\", \"string\"), (\"branch_code\", \"string\"),\n",
++    "                 (\"balance\", \"decimal(18,2)\"), (\"credit_limit\", \"decimal(18,2)\"), (\"status\", \"string\"),\n",
++    "                 (\"open_date\", \"date\"), (\"close_date\", \"date\"), (\"updated_at\", \"timestamp\")],\n",
++    "    \"account_holders\": [(\"account_id\", \"bigint\"), (\"customer_id\", \"bigint\"), (\"holder_role\", \"string\"),\n",
++    "                        (\"share_pct\", \"decimal(5,2)\"), (\"since_date\", \"date\")],\n",
++    "    \"transactions\": [(\"txn_id\", \"bigint\"), (\"account_id\", \"bigint\"), (\"txn_ts\", \"timestamp\"),\n",
++    "                     (\"txn_type\", \"string\"), (\"amount\", \"decimal(18,2)\"), (\"status\", \"string\"),\n",
++    "                     (\"channel\", \"string\"), (\"counterparty\", \"string\"), (\"memo\", \"string\"),\n",
++    "                     (\"updated_at\", \"timestamp\")],\n",
++    "    \"fx_rates_log\": [(\"rate_date\", \"date\"), (\"currency\", \"string\"), (\"usd_rate\", \"decimal(18,6)\"),\n",
++    "                     (\"source\", \"string\"), (\"loaded_at\", \"timestamp\")],\n",
++    "    \"acct_enriched\": [(\"account_id\", \"bigint\"), (\"account_no\", \"string\"), (\"customer_ref\", \"string\"),\n",
++    "                      (\"full_name\", \"string\"), (\"segment\", \"string\"), (\"account_type\", \"string\"),\n",
++    "                      (\"currency\", \"string\"), (\"balance\", \"decimal(18,2)\"), (\"branch_code\", \"string\"),\n",
++    "                      (\"branch_name\", \"string\"), (\"city\", \"string\"), (\"status\", \"string\")],\n",
++    "}\n",
++    "\n",
++    "\n",
++    "def register_staging():\n",
++    "    spark.sql(\"CREATE DATABASE IF NOT EXISTS %s\" % HIVE_DB)\n",
++    "    for name, cols in HIVE_COLS.items():\n",
++    "        col_sql = \", \".join(\"%s %s\" % c for c in cols)\n",
++    "        spark.sql(\"DROP TABLE IF EXISTS %s.stg_%s\" % (HIVE_DB, name))\n",
++    "        spark.sql(\n",
++    "            r\"\"\"CREATE EXTERNAL TABLE %s.stg_%s (%s)\n",
++    "                ROW FORMAT DELIMITED FIELDS TERMINATED BY '\\001' NULL DEFINED AS '\\\\N'\n",
++    "                STORED AS TEXTFILE\n",
++    "                LOCATION '%s'\"\"\" % (HIVE_DB, name, col_sql, target(name)))\n",
++    "        print(\"registered %s.stg_%s\" % (HIVE_DB, name))\n",
++    "\n",
++    "\n",
++    "def refresh_curated():\n",
++    "    for name in HIVE_COLS:\n",
++    "        spark.catalog.refreshTable(\"%s.stg_%s\" % (HIVE_DB, name))\n",
++    "    for name in HIVE_COLS:\n",
++    "        if name == \"transactions\":\n",
++    "            accts = spark.table(\"%s.stg_accounts\" % HIVE_DB).select(\"account_id\", \"customer_id\", \"currency\")\n",
++    "            tx = (spark.table(\"%s.stg_transactions\" % HIVE_DB)\n",
++    "                  .join(accts, \"account_id\", \"left\")\n",
++    "                  .withColumn(\"txn_date\", F.to_date(\"txn_ts\")))\n",
++    "            (tx.write.mode(\"overwrite\").format(\"parquet\").partitionBy(\"txn_date\")\n",
++    "               .saveAsTable(\"%s.transactions\" % HIVE_DB))\n",
++    "        else:\n",
++    "            (spark.table(\"%s.stg_%s\" % (HIVE_DB, name)).write.mode(\"overwrite\").format(\"parquet\")\n",
++    "             .saveAsTable(\"%s.%s\" % (HIVE_DB, name)))\n",
++    "        print(\"curated %s.%s\" % (HIVE_DB, name))\n",
++    "\n",
++    "\n",
++    "if USE_SQOOP:\n",
++    "    register_staging()\n",
++    "    refresh_curated()\n",
++    "    spark.sql(\"SHOW TABLES IN %s\" % HIVE_DB).show(50, False)"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "id": "5dedc3b5",
++   "metadata": {},
++   "source": [
++    "## 7. Validate: Postgres vs Hive\n",
++    "Row counts, sums of money columns, and NULL counts must match. The text columns that held newlines are compared as \"has newline\" (Hive should have none, because they were stripped on import)."
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "id": "48e9023a",
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "def validate():\n",
++    "    pairs = [\n",
++    "        (\"rows branches\",          \"SELECT count(*) FROM retail.branches\",         \"SELECT count(*) FROM %s.stg_branches\" % HIVE_DB),\n",
++    "        (\"rows customers\",         \"SELECT count(*) FROM retail.customers\",        \"SELECT count(*) FROM %s.stg_customers\" % HIVE_DB),\n",
++    "        (\"rows accounts\",          \"SELECT count(*) FROM retail.accounts\",         \"SELECT count(*) FROM %s.stg_accounts\" % HIVE_DB),\n",
++    "        (\"rows account_holders\",   \"SELECT count(*) FROM retail.account_holders\",  \"SELECT count(*) FROM %s.stg_account_holders\" % HIVE_DB),\n",
++    "        (\"rows transactions\",      \"SELECT count(*) FROM retail.transactions\",     \"SELECT count(*) FROM %s.stg_transactions\" % HIVE_DB),\n",
++    "        (\"rows transactions (curated)\", \"SELECT count(*) FROM retail.transactions\", \"SELECT count(*) FROM %s.transactions\" % HIVE_DB),\n",
++    "        (\"rows fx_rates_log (dups kept)\", \"SELECT count(*) FROM retail.fx_rates_log\", \"SELECT count(*) FROM %s.stg_fx_rates_log\" % HIVE_DB),\n",
++    "        (\"rows acct_enriched\",     \"SELECT count(*) FROM retail.accounts\",         \"SELECT count(*) FROM %s.stg_acct_enriched\" % HIVE_DB),\n",
++    "        (\"sum accounts.balance\",   \"SELECT sum(balance) FROM retail.accounts\",     \"SELECT sum(balance) FROM %s.stg_accounts\" % HIVE_DB),\n",
++    "        (\"sum transactions.amount\", \"SELECT sum(amount) FROM retail.transactions\", \"SELECT sum(amount) FROM %s.stg_transactions\" % HIVE_DB),\n",
++    "        (\"NULL customers.email\",   \"SELECT count(*) FROM retail.customers WHERE email IS NULL\", \"SELECT count(*) FROM %s.stg_customers WHERE email IS NULL\" % HIVE_DB),\n",
++    "        (\"NULL customers.date_of_birth\", \"SELECT count(*) FROM retail.customers WHERE date_of_birth IS NULL\", \"SELECT count(*) FROM %s.stg_customers WHERE date_of_birth IS NULL\" % HIVE_DB),\n",
++    "        (\"NULL transactions.channel\", \"SELECT count(*) FROM retail.transactions WHERE channel IS NULL\", \"SELECT count(*) FROM %s.stg_transactions WHERE channel IS NULL\" % HIVE_DB),\n",
++    "        (\"empty-string notes (not NULL)\", \"SELECT count(*) FROM retail.customers WHERE notes = ''\", \"SELECT count(*) FROM %s.stg_customers WHERE notes = ''\" % HIVE_DB),\n",
++    "        (\"PG notes with newline -> Hive 0\", \"SELECT 0\", r\"SELECT count(*) FROM %s.stg_customers WHERE notes LIKE '%%\\n%%'\" % HIVE_DB),\n",
++    "    ]\n",
++    "    ok = True\n",
++    "    print(\"%-34s %18s %18s  %s\" % (\"check\", \"postgres\", \"hive\", \"\"))\n",
++    "    for label, pg_sql, hv_sql in pairs:\n",
++    "        a = pg_query(pg_sql)[0][0]\n",
++    "        b = spark.sql(hv_sql).collect()[0][0]\n",
++    "        same = (str(a) == str(b)) or (a is not None and b is not None and float(a) == float(b))\n",
++    "        ok &= bool(same)\n",
++    "        print(\"%-34s %18s %18s  %s\" % (label, a, b, \"OK\" if same else \"MISMATCH\"))\n",
++    "    print(\"\\nALL CHECKS PASSED\" if ok else \"\\nSOME CHECKS FAILED\")\n",
++    "\n",
++    "\n",
++    "if USE_SQOOP:\n",
++    "    validate()"
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "id": "fd3bdcb5",
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "# Peek at the complex columns on the Hive side\n",
++    "if USE_SQOOP:\n",
++    "    spark.sql(\"\"\"SELECT customer_ref, segment, tags, address_json, notes\n",
++    "                 FROM %s.customers WHERE tags IS NOT NULL LIMIT 5\"\"\" % HIVE_DB).show(5, False)\n",
++    "    spark.sql(\"\"\"SELECT txn_date, count(*) AS txns, round(sum(amount), 2) AS total\n",
++    "                 FROM %s.transactions GROUP BY txn_date ORDER BY txn_date DESC LIMIT 5\"\"\" % HIVE_DB).show()"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "id": "4964967c",
++   "metadata": {},
++   "source": [
++    "## 8. Simulate a day of changes and run the incremental jobs again\n",
++    "Adds 5,000 transactions, changes 300 accounts and adds 50 accounts in Postgres. Only that delta should move."
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "id": "1680401a",
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "if USE_SQOOP:\n",
++    "    before_tx = spark.sql(\"SELECT count(*) FROM %s.stg_transactions\" % HIVE_DB).collect()[0][0]\n",
++    "    run_sql_file(\"03_incremental_changes.sql\")\n",
++    "    exec_saved_job(\"poc_transactions_append\")      # appends only txn_id > last value\n",
++    "    exec_saved_job(\"poc_accounts_lastmodified\")    # merges rows with updated_at > last value\n",
++    "    refresh_curated()\n",
++    "    after_tx = spark.sql(\"SELECT count(*) FROM %s.stg_transactions\" % HIVE_DB).collect()[0][0]\n",
++    "    print(\"transactions in Hive: %d -> %d (expected +5000)\" % (before_tx, after_tx))\n",
++    "    validate()"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "id": "5f155c16",
++   "metadata": {},
++   "source": [
++    "## 9. Fallback: Spark JDBC instead of Sqoop\n",
++    "Use this if `sqoop` is not installed where the notebook runs. Set `USE_SQOOP = False` in the config cell, run sections 0-2, then run this section. It reads Postgres in parallel and writes Parquet tables into `sqoop_poc_spark`."
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "id": "5e32902c",
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "RUN_JDBC_FALLBACK = not USE_SQOOP\n",
++    "JDBC_DB = \"sqoop_poc_spark\"\n",
++    "\n",
++    "JDBC_SOURCES = {   # name -> (dbtable or subquery, partition column or None)\n",
++    "    \"branches\": (\"retail.branches\", None),\n",
++    "    \"customers\": (\"\"\"(SELECT c.customer_id, c.customer_ref, c.full_name, c.email, c.segment::text AS segment,\n",
++    "                            c.country, c.kyc_status, c.pep_flag, c.date_of_birth, c.onboard_ts,\n",
++    "                            c.address::text AS address_json, array_to_string(c.tags, '|') AS tags,\n",
++    "                            c.notes, c.updated_at FROM retail.customers c) t\"\"\", \"customer_id\"),\n",
++    "    \"accounts\": (\"retail.accounts\", \"account_id\"),\n",
++    "    \"account_holders\": (\"retail.account_holders\", \"account_id\"),\n",
++    "    \"transactions\": (\"retail.transactions\", \"txn_id\"),\n",
++    "    \"fx_rates_log\": (\"retail.fx_rates_log\", None),\n",
++    "}\n",
++    "\n",
++    "\n",
++    "def jdbc_copy(name, dbtable, part_col, partitions=8):\n",
++    "    reader = (spark.read.format(\"jdbc\").option(\"url\", JDBC_URL).option(\"dbtable\", dbtable)\n",
++    "              .option(\"user\", PG[\"user\"]).option(\"password\", PG[\"password\"])\n",
++    "              .option(\"driver\", \"org.postgresql.Driver\"))\n",
++    "    if part_col:\n",
++    "        lo, hi = pg_query(\"SELECT min(%s), max(%s) FROM %s\" % (part_col, part_col,\n",
++    "                          \"retail.\" + name))[0]\n",
++    "        reader = (reader.option(\"partitionColumn\", part_col).option(\"lowerBound\", int(lo))\n",
++    "                  .option(\"upperBound\", int(hi)).option(\"numPartitions\", partitions))\n",
++    "    df = reader.load()\n",
++    "    if name == \"transactions\":\n",
++    "        df = df.withColumn(\"txn_date\", F.to_date(\"txn_ts\"))\n",
++    "        df.write.mode(\"overwrite\").format(\"parquet\").partitionBy(\"txn_date\").saveAsTable(\"%s.%s\" % (JDBC_DB, name))\n",
++    "    else:\n",
++    "        df.write.mode(\"overwrite\").format(\"parquet\").saveAsTable(\"%s.%s\" % (JDBC_DB, name))\n",
++    "    print(\"%-16s %d rows -> %s.%s\" % (name, spark.table(\"%s.%s\" % (JDBC_DB, name)).count(), JDBC_DB, name))\n",
++    "\n",
++    "\n",
++    "if RUN_JDBC_FALLBACK:\n",
++    "    spark.sql(\"CREATE DATABASE IF NOT EXISTS %s\" % JDBC_DB)\n",
++    "    for n, (tbl, col) in JDBC_SOURCES.items():\n",
++    "        jdbc_copy(n, tbl, col)"
++   ]
++  },
++  {
++   "cell_type": "markdown",
++   "id": "1178bfa7",
++   "metadata": {},
++   "source": [
++    "## 10. See it in Hue\n",
++    "* **File Browser**: `/data/sqoop_poc/raw/<table>/part-m-*` are the raw Sqoop files.\n",
++    "* **Hive / SQL editor**: run\n",
++    "  ```sql\n",
++    "  SHOW TABLES IN sqoop_poc;\n",
++    "  SELECT segment, count(*) FROM sqoop_poc.customers GROUP BY segment;\n",
++    "  SELECT txn_date, count(*) FROM sqoop_poc.transactions GROUP BY txn_date ORDER BY txn_date DESC;\n",
++    "  ```\n",
++    "\n",
++    "## Notes\n",
++    "* **Hive 4.1 metastore**: Sqoop's own `--hive-import` uses an old Hive client and often fails against Hive 4. That is why this notebook lets Sqoop write files to HDFS and registers the tables with Spark instead.\n",
++    "* **Re-running**: the notebook drops and recreates the Postgres schema, wipes the HDFS target dirs and replaces the Hive tables, so it can be run again from the top.\n",
++    "* **Cleanup**: `DROP DATABASE sqoop_poc CASCADE;` in Hue, and `hdfs dfs -rm -r /data/sqoop_poc` for the raw files."
++   ]
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "id": "b6975271-d748-46d7-909f-d308be1d15de",
++   "metadata": {},
++   "outputs": [],
++   "source": []
++  },
++  {
++   "cell_type": "code",
++   "execution_count": null,
++   "id": "a622a2f9-6b2e-4409-87a0-48c98c22d677",
++   "metadata": {},
++   "outputs": [],
++   "source": [
++    "spark.sql(\"SHOW DATABASES\").show(truncate=False)"
++   ]
++  }
++ ],
++ "metadata": {
++  "kernelspec": {
++   "display_name": "Python 3 (ipykernel)",
++   "language": "python",
++   "name": "python3"
++  },
++  "language_info": {
++   "codemirror_mode": {
++    "name": "ipython",
++    "version": 3
++   },
++   "file_extension": ".py",
++   "mimetype": "text/x-python",
++   "name": "python",
++   "nbconvert_exporter": "python",
++   "pygments_lexer": "ipython3",
++   "version": "3.11.9"
++  }
++ },
++ "nbformat": 4,
++ "nbformat_minor": 5
++}
+diff --git a/sqoop_poc/sqoop_to_yaml.ipynb b/sqoop_poc/sqoop_to_yaml.ipynb
+new file mode 100644
+index 0000000..d5dea5d
+--- /dev/null
++++ b/sqoop_poc/sqoop_to_yaml.ipynb
+@@ -0,0 +1,147 @@
++{
++ "cells": [
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "# Sqoop jobs → intermediate YAML\n",
++    "Runs `agentic.sqoop_yaml` (the same converter behind `POST /api/sqoop-yaml` and the *Sqoop jobs to YAML* tab of\n",
++    "`ui/compare_app.py`). Keep this notebook in `sqoop_poc/`; it works from the project root. Put your Sqoop commands in\n",
++    "`SQOOP_FILE`, one per line."
++   ],
++   "id": "38473c08"
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "import os, sys, subprocess\n",
++    "import yaml\n",
++    "\n",
++    "ROOT = os.path.abspath(\"..\")                      # the project folder\n",
++    "if ROOT not in sys.path:\n",
++    "    sys.path.insert(0, ROOT)\n",
++    "subprocess.check_call([sys.executable, \"-m\", \"pip\", \"install\", \"-q\", \"pyyaml\", \"trino\"])\n",
++    "\n",
++    "from agentic.spark_compare import load_source\n",
++    "from agentic.sqoop_yaml import Options, convert\n",
++    "\n",
++    "SQOOP_FILE = os.path.join(ROOT, \"samples\", \"sqoop_jobs.txt\")   # your Sqoop commands\n",
++    "DDL_FILE   = \"01_schema.sql\"         # source table definitions (or set TRINO_URL instead)\n",
++    "TRINO_URL  = None                    # e.g. \"http://172.171.240.8:8082\" (reads the landed copies)\n",
++    "TRINO_SCHEMA = \"hive.sqoop_poc_spark\"  # where Trino finds those tables\n",
++    "OUT_DIR    = os.path.join(ROOT, \"output\")\n",
++    "\n",
++    "TARGET = Options(project_id=\"sqoop_poc\", target_catalog=\"ice\", target_namespace=\"sqoop_poc_iceberg\",\n",
++    "                 target_storage=\"hdfs://172.16.0.4:9000/user/hive/warehouse/sqoop_poc_iceberg.db\")"
++   ],
++   "id": "7cedf64d"
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## 1. Generate one YAML file per Sqoop job"
++   ],
++   "id": "e20a7156"
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "ddl = load_source(path=DDL_FILE) if not TRINO_URL and os.path.exists(DDL_FILE) else None\n",
++    "res = convert(load_source(path=SQOOP_FILE), ddl, TARGET,\n",
++    "              trino_url=TRINO_URL, trino_schema=TRINO_SCHEMA if TRINO_URL else None, out_base=OUT_DIR)\n",
++    "for w in res[\"report\"][\"warnings\"]:\n",
++    "    print(\"note:\", w)\n",
++    "for j in res[\"report\"][\"jobs\"]:\n",
++    "    print(\"%-28s %-26s findings=%d (blocking execution: %d)\" % (j[\"job_id\"], j[\"load_mode\"], j[\"findings\"], j[\"blocking_execution\"]))\n",
++    "print(\"files in\", res[\"folder\"])"
++   ],
++   "id": "40a40d6c"
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## 2. Look at one file"
++   ],
++   "id": "fb00fb73"
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "files = res[\"files\"][\"yaml\"]\n",
++    "assert files, \"no YAML generated: check the output of the cell above\"\n",
++    "print(\"\\n\".join(sorted(files.values())))\n",
++    "print(res[\"yaml\"][sorted(files)[0]])"
++   ],
++   "id": "c831dae4"
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## 3. Summary of findings across all jobs"
++   ],
++   "id": "da90a786"
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "rows = res[\"report\"][\"findings\"]\n",
++    "try:\n",
++    "    import pandas as pd\n",
++    "    pd.set_option(\"display.max_colwidth\", 120)\n",
++    "    display(pd.DataFrame(rows)[[\"job\", \"id\", \"category\", \"severity\", \"blocks\", \"evidence\"]])\n",
++    "except ImportError:\n",
++    "    for r_ in rows: print(r_)"
++   ],
++   "id": "f7391ae6"
++  },
++  {
++   "cell_type": "markdown",
++   "metadata": {},
++   "source": [
++    "## 4. Coverage: how every Sqoop option was handled"
++   ],
++   "id": "2d080cbf"
++  },
++  {
++   "cell_type": "code",
++   "metadata": {},
++   "execution_count": null,
++   "outputs": [],
++   "source": [
++    "for f in sorted(files.values()):\n",
++    "    spec = yaml.safe_load(open(f))\n",
++    "    print(spec[\"job_id\"])\n",
++    "    for c in spec[\"coverage\"]:\n",
++    "        print(\"   %-28s %-12s %s\" % (c[\"construct\"], c[\"status\"], (c.get(\"refs\") or c.get(\"finding_refs\") or [c.get(\"reason\", \"\")])[0]))"
++   ],
++   "id": "df15e84d"
++  }
++ ],
++ "metadata": {
++  "kernelspec": {
++   "display_name": "Python 3 (ipykernel)",
++   "language": "python",
++   "name": "python3"
++  },
++  "language_info": {
++   "name": "python"
++  }
++ },
++ "nbformat": 4,
++ "nbformat_minor": 5
++}
+diff --git a/tests/fixtures/sqoop_account_holders_expected.yaml b/tests/fixtures/sqoop_account_holders_expected.yaml
+new file mode 100644
+index 0000000..03fa6b2
+--- /dev/null
++++ b/tests/fixtures/sqoop_account_holders_expected.yaml
+@@ -0,0 +1,240 @@
++# Proposed draft, NOT an executable contract (no sqoop_to_spark schema installed yet).
++# Generated by sqoop_to_yaml.py (sqoop_rules 0.1) from sqoop_jobs.txt lines 14-16.
++contract_family: sqoop_to_spark
++contract_version: null
++status: draft
++execution_eligible: false
++project_id: sqoop_poc
++job_id: account_holders
++revision: 1
++description: Sqoop import of retail.account_holders into an Iceberg table via Spark JDBC.
++source:
++  tool: sqoop
++  version: 1.4.7
++  files:
++  - id: file_sqoop
++    path: sqoop_jobs.txt
++    sha256: 8beaa301c856175b09dbe9dbed18fb3b3fa4333841b06374490b454ba415e5af
++    locator: lines 14-16
++  saved_job: null
++  command_redacted: sqoop import --connect jdbc:postgresql://172.16.0.4:5432/sourcedb --username postgres --password-file
++    /user/jovyan/.pg_sqoop.pw --fields-terminated-by '\001' --lines-terminated-by '\n' --null-string '\\N' --null-non-string
++    '\\N' --hive-drop-import-delims --target-dir /data/sqoop_poc/raw/account_holders -m 4 --table account_holders
++    --split-by account_id -- --schema retail
++  metadata_snapshot: ddl:01_schema.sql
++target:
++  runtime_family: Spark 3.5.x
++  table_format: iceberg
++  environment_ref: null
++connection:
++  id: conn_source
++  type: jdbc
++  system: postgres
++  jdbc_url: jdbc:postgresql://172.16.0.4:5432/sourcedb
++  host: 172.16.0.4
++  port: 5432
++  database: sourcedb
++  username: postgres
++  authentication:
++    method: password_file
++    secret_ref: /user/jovyan/.pg_sqoop.pw
++  properties:
++    schema: retail
++  evidence_refs:
++  - prov_cmd
++ingestion:
++  direction: import
++  read:
++    mode: table
++    table: retail.account_holders
++    query: null
++    columns: null
++    where: null
++    fetch_size: null
++    boundary_query: null
++    consistency: unknown
++  split:
++    split_by: account_id
++    parallelism: 4
++    lower_bound: null
++    upper_bound: null
++    bounds_source: min/max query at run time
++  load:
++    mode: full
++    watermark: null
++    merge_keys: null
++    write_intent: overwrite_scope_unapproved
++  column_mappings:
++  - source_column: account_id
++    source_type: BIGINT
++    nullable: false
++    target_column: account_id
++    target_type: bigint
++    mapping_rule: type_map
++  - source_column: customer_id
++    source_type: BIGINT
++    nullable: false
++    target_column: customer_id
++    target_type: bigint
++    mapping_rule: type_map
++  - source_column: holder_role
++    source_type: VARCHAR(10)
++    nullable: false
++    target_column: holder_role
++    target_type: string
++    mapping_rule: type_map
++  - source_column: share_pct
++    source_type: NUMERIC(5,2)
++    nullable: false
++    target_column: share_pct
++    target_type: decimal(5,2)
++    mapping_rule: type_map
++  - source_column: since_date
++    source_type: DATE
++    nullable: null
++    target_column: since_date
++    target_type: date
++    mapping_rule: type_map
++  text_handling:
++    drop_import_delims: true
++    null_string: \\N
++    null_non_string: \\N
++  destination:
++    sqoop_landing:
++      target_dir: /data/sqoop_poc/raw/account_holders
++      warehouse_dir: null
++      hive_database: null
++      hive_table: null
++    target_table:
++      catalog: ice
++      namespace: sqoop_poc_iceberg
++      name: account_holders
++      format: iceberg
++      storage: hdfs://172.16.0.4:9000/user/hive/warehouse/sqoop_poc_iceberg.db
++parameters: []
++dependencies:
++- id: dep_db
++  type: database
++  ref: conn_source
++  objects:
++  - retail.account_holders
++- id: dep_landing
++  type: hdfs_path
++  ref: /data/sqoop_poc/raw/account_holders
++  note: Sqoop landing path; not a target mapping
++provenance:
++- id: prov_cmd
++  file_ref: file_sqoop
++  locator: lines 14-16
++  extraction_method: shlex_parse_sqoop_rules_0.1
++findings:
++- id: account_holders.F01
++  category: operational
++  severity: low
++  confidence: medium
++  source_ref: null
++  evidence: 'Read consistency is unknown: Sqoop mappers read in separate transactions.'
++  affected_refs:
++  - ingestion.read
++  blocks: []
++  status: open
++  resolution: Accept, or require a snapshot/consistent read.
++  rule_ref: sqoop_rules 0.1/read_consistency
++- id: account_holders.F02
++  category: operational
++  severity: medium
++  confidence: high
++  source_ref: sqoop_jobs.txt:14-16
++  evidence: 'Full import: overwrite scope of the target table is not approved.'
++  affected_refs:
++  - ingestion.destination
++  blocks:
++  - execution
++  status: open
++  resolution: Approve full-table replacement of the isolated test table.
++  rule_ref: sqoop_rules 0.1/overwrite_scope
++- id: account_holders.F03
++  category: business_assumption
++  severity: medium
++  confidence: high
++  source_ref: sqoop_jobs.txt:14-16
++  evidence: Sqoop removed \n, \r and \001 from text values; Spark JDBC does not. Decide whether the target must
++    keep that cleaning.
++  affected_refs:
++  - ingestion
++  blocks:
++  - execution
++  status: open
++  resolution: Decide and record the target behavior.
++  rule_ref: sqoop_rules 0.1/flag_hive-drop-import-delims
++- id: account_holders.F04
++  category: configuration
++  severity: critical
++  confidence: high
++  source_ref: null
++  evidence: No executable sqoop_to_spark schema or capability registry is installed; this file is a proposed draft.
++  affected_refs:
++  - account_holders
++  blocks:
++  - execution
++  status: open
++  resolution: Install the contract and registry, then re-validate.
++  rule_ref: sqoop_rules 0.1/missing_executable_contract
++coverage:
++- construct: --connect
++  status: represented
++  refs:
++  - connection.jdbc_url
++- construct: --username
++  status: represented
++  refs:
++  - connection.username
++- construct: --password-file
++  status: represented
++  refs:
++  - connection.authentication
++- construct: --fields-terminated-by
++  status: irrelevant
++  reason: Iceberg/Parquet stores typed columns; no field delimiter
++- construct: --lines-terminated-by
++  status: irrelevant
++  reason: Iceberg/Parquet has no line delimiter
++- construct: --null-string
++  status: irrelevant
++  reason: Iceberg stores real NULLs; no null marker string
++- construct: --null-non-string
++  status: irrelevant
++  reason: Iceberg stores real NULLs; no null marker string
++- construct: --hive-drop-import-delims
++  status: unresolved
++  finding_refs:
++  - account_holders.F03
++- construct: --target-dir
++  status: represented
++  refs:
++  - ingestion.destination.sqoop_landing
++- construct: --num-mappers
++  status: represented
++  refs:
++  - ingestion.split.parallelism
++- construct: --table
++  status: represented
++  refs:
++  - ingestion.read.table
++- construct: --split-by
++  status: represented
++  refs:
++  - ingestion.split.split_by
++- construct: -- --schema
++  status: represented
++  refs:
++  - connection.properties
++versions:
++  rules: sqoop_rules 0.1
++  skill: .agents/skills/sqoop-to-spark@94b4b18
++  analysis: null
++  framework: null
++artifacts: []
++review:
++  status: pending
++  decisions: []
+diff --git a/tests/fixtures/sqoop_source_schema.sql b/tests/fixtures/sqoop_source_schema.sql
+new file mode 100644
+index 0000000..aa809df
+--- /dev/null
++++ b/tests/fixtures/sqoop_source_schema.sql
+@@ -0,0 +1,56 @@
++-- Test fixture: source tables of the Sqoop POC (Postgres schema "retail"), rebuilt from the column lists in the
++-- POC notebook. Not the POC's 01_schema.sql; customers (enum, JSONB, text[]) is left out on purpose because the
++-- POC imports it through a free-form query.
++CREATE TABLE retail.branches (
++    branch_code  VARCHAR(8)   PRIMARY KEY,
++    branch_name  VARCHAR(80)  NOT NULL,
++    city         VARCHAR(60),
++    state_code   CHAR(2),
++    opened_date  DATE,
++    is_active    BOOLEAN      NOT NULL DEFAULT true
++);
++
++CREATE TABLE retail.accounts (
++    account_id    BIGSERIAL     PRIMARY KEY,
++    account_no    VARCHAR(20)   NOT NULL UNIQUE,
++    customer_id   BIGINT        NOT NULL REFERENCES retail.customers (customer_id),
++    account_type  VARCHAR(12)   NOT NULL,
++    currency      CHAR(3)       NOT NULL,
++    branch_code   VARCHAR(8)    REFERENCES retail.branches (branch_code),
++    balance       NUMERIC(18,2) NOT NULL,
++    credit_limit  NUMERIC(18,2),
++    status        VARCHAR(10)   NOT NULL,
++    open_date     DATE          NOT NULL,
++    close_date    DATE,
++    updated_at    TIMESTAMP     NOT NULL DEFAULT now()
++);
++
++CREATE TABLE retail.account_holders (
++    account_id   BIGINT       NOT NULL REFERENCES retail.accounts (account_id),
++    customer_id  BIGINT       NOT NULL REFERENCES retail.customers (customer_id),
++    holder_role  VARCHAR(10)  NOT NULL,
++    share_pct    NUMERIC(5,2) NOT NULL,
++    since_date   DATE,
++    PRIMARY KEY (account_id, customer_id)
++);
++
++CREATE TABLE retail.transactions (
++    txn_id        BIGSERIAL     PRIMARY KEY,
++    account_id    BIGINT        NOT NULL REFERENCES retail.accounts (account_id),
++    txn_ts        TIMESTAMP     NOT NULL,
++    txn_type      VARCHAR(12)   NOT NULL,
++    amount        NUMERIC(18,2) NOT NULL,
++    status        VARCHAR(10)   NOT NULL,
++    channel       VARCHAR(10),
++    counterparty  VARCHAR(120),
++    memo          TEXT,
++    updated_at    TIMESTAMP     NOT NULL DEFAULT now()
++);
++
++CREATE TABLE retail.fx_rates_log (
++    rate_date  DATE          NOT NULL,
++    currency   CHAR(3)       NOT NULL,
++    usd_rate   NUMERIC(18,6) NOT NULL,
++    source     VARCHAR(20),
++    loaded_at  TIMESTAMP     NOT NULL DEFAULT now()
++);
+diff --git a/tests/test_sqoop_yaml.py b/tests/test_sqoop_yaml.py
+new file mode 100644
+index 0000000..db45d55
+--- /dev/null
++++ b/tests/test_sqoop_yaml.py
+@@ -0,0 +1,147 @@
++"""Sqoop jobs -> intermediate YAML (agentic.sqoop_yaml), on the POC's Sqoop commands (samples/sqoop_jobs.txt).
++
++The expected account_holders file is the one the POC notebook generated (tests/fixtures/sqoop_account_holders_expected.yaml),
++so these tests also show the merged module reproduces the original script.
++"""
++import json
++import os
++import tempfile
++import unittest
++from unittest import mock
++
++import yaml
++
++from agentic.spark_compare import Source, load_source
++from agentic.sqoop_yaml import Options, build_specs, convert, spec_yaml
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++ROOT = os.path.dirname(HERE)
++SQOOP = os.path.join(ROOT, "samples", "sqoop_jobs.txt")
++DDL = os.path.join(HERE, "fixtures", "sqoop_source_schema.sql")
++EXPECTED = os.path.join(HERE, "fixtures", "sqoop_account_holders_expected.yaml")
++NOTEBOOK_SKILL = ".agents/skills/sqoop-to-spark@94b4b18"
++
++POC = Options(project_id="sqoop_poc", target_catalog="ice", target_namespace="sqoop_poc_iceberg",
++              target_storage="hdfs://172.16.0.4:9000/user/hive/warehouse/sqoop_poc_iceberg.db")
++
++
++def read(path):
++    with open(path, encoding="utf-8") as fh:
++        return fh.read()
++
++
++def poc_specs(options=POC, ddl=True):
++    # same labels as the notebook run: the commands file and the DDL file as named there
++    sqoop = load_source(path=SQOOP, name="sqoop_jobs.txt")
++    schema = load_source(path=DDL, name="01_schema.sql") if ddl else None
++    return {s["job_id"]: s for s in build_specs(sqoop, schema, options)["specs"]}
++
++
++class SqoopYamlCase(unittest.TestCase):
++    def test_reproduces_notebook_output(self):
++        opt = Options(**{**POC.__dict__, "skill_ref": NOTEBOOK_SKILL})
++        spec = poc_specs(opt)["account_holders"]
++        self.assertEqual(spec, yaml.safe_load(read(EXPECTED)))
++
++    def test_jobs_and_finding_counts_match_notebook(self):
++        specs = poc_specs()
++        counts = {j: (len(s["findings"]), sum("execution" in f["blocks"] for f in s["findings"]), s["ingestion"]["load"]["mode"])
++                  for j, s in specs.items()}
++        self.assertEqual(counts, {
++            "branches": (4, 3, "full"), "customers": (6, 5, "full"), "account_holders": (4, 3, "full"),
++            "fx_rates_log": (5, 4, "full"), "acct_enriched": (6, 5, "full"),
++            "poc_transactions_append": (4, 3, "incremental_append"),
++            "poc_accounts_lastmodified": (5, 4, "incremental_lastmodified")})
++
++    def test_every_option_is_covered(self):
++        for s in poc_specs().values():
++            self.assertTrue(s["coverage"])
++            for c in s["coverage"]:
++                self.assertIn(c["status"], ("represented", "irrelevant", "unresolved", "unsupported"))
++                if c["status"] in ("unresolved", "unsupported"):
++                    self.assertTrue(c.get("finding_refs"), c)
++
++    def test_incremental_keeps_watermark_and_merge_key(self):
++        load = poc_specs()["poc_accounts_lastmodified"]["ingestion"]["load"]
++        self.assertEqual(load["watermark"]["column"], "updated_at")
++        self.assertEqual(load["watermark"]["state_store"], "sqoop_saved_job")
++        self.assertEqual(load["merge_keys"], ["account_id"])
++        self.assertEqual(load["write_intent"], "merge")
++
++    def test_inline_password_is_redacted_and_blocks(self):
++        cmd = ("sqoop import --connect jdbc:postgresql://db:5432/src --username etl --password s3cretValue "
++               "--table orders --target-dir /raw/orders -m 1 -- --schema sales\n")
++        spec = build_specs(Source("jobs.txt", cmd), options=POC)["specs"][0]
++        text = spec_yaml(spec)
++        self.assertNotIn("s3cretValue", text)
++        self.assertEqual(spec["connection"]["authentication"]["method"], "inline_password")
++        self.assertTrue(any(f["category"] == "security" and f["severity"] == "critical" for f in spec["findings"]))
++
++    def test_missing_target_blocks_generation(self):
++        spec = poc_specs(Options())["branches"]
++        f = [x for x in spec["findings"] if x["rule_ref"].endswith("/target_explicit")]
++        self.assertEqual(len(f), 1)
++        self.assertIn("generation", f[0]["blocks"])
++
++    def test_export_is_not_converted_to_import(self):
++        cmd = "sqoop export --connect jdbc:mysql://db/sales --username etl --password-file /p --table t --export-dir /x\n"
++        spec = build_specs(Source("jobs.txt", cmd), options=POC)["specs"][0]
++        self.assertEqual(spec["ingestion"]["direction"], "export")
++        self.assertTrue(any(f["rule_ref"].endswith("/direction") and f["severity"] == "critical" for f in spec["findings"]))
++
++    def test_ddl_and_trino_are_exclusive(self):
++        with self.assertRaises(ValueError):
++            build_specs(Source("j.txt", ""), Source("d.sql", ""), trino_url="http://trino:8080")
++
++    def test_convert_writes_one_folder(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            res = convert(load_source(path=SQOOP, name="sqoop_jobs.txt"), load_source(path=DDL), POC, out_base=tmp)
++            self.assertEqual(os.path.dirname(res["folder"]), tmp)
++            self.assertTrue(os.path.basename(res["folder"]).startswith("sqoop_jobs_"))
++            self.assertEqual(len(res["files"]["yaml"]), 7)
++            for job_id, path in res["files"]["yaml"].items():
++                self.assertEqual(yaml.safe_load(read(path))["job_id"], job_id)
++            report = json.loads(read(res["files"]["json"]))
++            self.assertEqual(report["summary"]["jobs"], 7)
++            self.assertEqual(report["summary"]["findings"], 34)
++            self.assertIn("## Coverage", read(res["files"]["markdown"]))
++
++
++class SqoopYamlApiCase(unittest.TestCase):
++    def setUp(self):
++        try:
++            from fastapi.testclient import TestClient
++        except ImportError:
++            self.skipTest("fastapi (and httpx) are not installed")
++        from agentic import api
++        self.client = TestClient(api.app)
++        self.tmp = tempfile.TemporaryDirectory()
++        patch = mock.patch("agentic.sqoop_yaml.ui_settings", return_value={"out_dir": self.tmp.name})
++        patch.start()
++        self.addCleanup(patch.stop)
++        self.addCleanup(self.tmp.cleanup)
++
++    def test_convert_by_path(self):
++        r = self.client.post("/api/sqoop-yaml", json={
++            "sqoop": {"path": "samples/sqoop_jobs.txt"}, "ddl": {"path": "tests/fixtures/sqoop_source_schema.sql"},
++            "project_id": "sqoop_poc", "target_catalog": "ice", "target_namespace": "sqoop_poc_iceberg",
++            "target_storage": "hdfs://nn:9000/warehouse/sqoop_poc_iceberg.db"})
++        self.assertEqual(r.status_code, 200, r.text)
++        data = r.json()
++        self.assertEqual(data["summary"]["jobs"], 7)
++        self.assertIn("account_holders", data["yaml"])
++        self.assertTrue(data["yaml"]["account_holders"].startswith("# Proposed draft"))
++
++    def test_path_outside_project_is_rejected(self):
++        r = self.client.post("/api/sqoop-yaml", json={"sqoop": {"path": "../outside.txt"}})
++        self.assertEqual(r.status_code, 400)
++
++    def test_ddl_and_trino_together_is_rejected(self):
++        r = self.client.post("/api/sqoop-yaml", json={"sqoop": {"code": "sqoop import --table t"},
++                                                      "ddl": {"code": "CREATE TABLE t (a int)"},
++                                                      "trino_url": "http://trino:8080"})
++        self.assertEqual(r.status_code, 422)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/ui/compare_app.py b/ui/compare_app.py
+index 8a28cc5..c3c75bb 100644
+--- a/ui/compare_app.py
++++ b/ui/compare_app.py
+@@ -1,4 +1,5 @@
+-"""Spark 2 to Spark 3 comparison and job code execution, through the migration API (agentic/api.py).
++"""Spark 2 to Spark 3 comparison, Sqoop jobs to intermediate YAML, and job code execution, through the migration API
++(agentic/api.py).
+ 
+ This page calls the API over HTTP, so it does not import the framework. Start the API first:
+ 
+@@ -11,7 +12,9 @@ then the page:
+ The API address and the execution token can be set in the sidebar, or through the environment variables
+ MIGRATION_API_URL and FRAMEWORK_API_TOKEN. The token is never written to disk by this page.
+ """
++import io
+ import os
++import zipfile
+ 
+ import requests
+ import streamlit as st
+@@ -21,7 +24,7 @@ DEFAULT_URL = os.environ.get("MIGRATION_API_URL", "http://127.0.0.1:8000")
+ DEFAULT_TOKEN = os.environ.get("FRAMEWORK_API_TOKEN", "")
+ RUN_DATE_DEFAULT = "2026-10-18"
+ 
+-st.set_page_config(page_title="Spark Job Comparison and Execution", layout="wide")
++st.set_page_config(page_title="Migration Tools", layout="wide")
+ 
+ 
+ def api(method: str, base: str, path: str, token: str = "", json_body=None, timeout: int = 60):
+@@ -71,8 +74,8 @@ with st.sidebar:
+             else:
+                 st.info("Code execution is disabled on the API host.")
+ 
+-st.title("Spark Job Comparison and Execution")
+-tab_compare, tab_run = st.tabs(["Compare Spark 2 and Spark 3", "Check or run job code"])
++st.title("Migration Tools")
++tab_compare, tab_sqoop, tab_run = st.tabs(["Compare Spark 2 and Spark 3", "Sqoop jobs to YAML", "Check or run job code"])
+ 
+ # ---------- compare ----------
+ 
+@@ -146,6 +149,105 @@ with tab_compare:
+                 col.download_button(label, text, file_name=os.path.basename(files[key]), mime=mime)
+         st.caption(f"Saved to {result['folder']}")
+ 
++# ---------- sqoop to yaml ----------
++
++with tab_sqoop:
++    st.write("Upload a file of Sqoop commands (one per line; `\\` continuations and `sqoop job --create` saved jobs "
++             "work) and, optionally, the source database's CREATE TABLE statements for the column mappings. The API "
++             "writes one draft YAML file per job. The conversion does not use an LLM or Sqoop.")
++    c1, c2 = st.columns(2)
++    with c1:
++        up_sqoop = st.file_uploader("Sqoop commands", type=["txt", "sh"], key="up_sqoop")
++    with c2:
++        up_ddl = st.file_uploader("Source table DDL (optional)", type=["sql", "ddl", "hql"], key="up_ddl")
++
++    with st.expander("Target and metadata settings"):
++        t1, t2 = st.columns(2)
++        project_id = t1.text_input("Project id", value="project_01")
++        target_catalog = t2.text_input("Iceberg catalog", help="Never guessed: if left empty, a finding blocks generation.")
++        target_namespace = t1.text_input("Iceberg namespace")
++        target_storage = t2.text_input("Warehouse location", help="For example hdfs://<namenode>:9000/user/hive/warehouse/<namespace>.db")
++        trino_url = t1.text_input("Trino URL (instead of DDL, optional)", disabled=bool(up_ddl),
++                                  help="Reads the column metadata from Trino's information_schema, read-only.")
++        trino_schema = t2.text_input("Trino catalog.schema", disabled=bool(up_ddl), help="For example hive.sqoop_poc_spark")
++
++    if st.button("Convert to YAML", type="primary", disabled=not up_sqoop):
++        body = {"sqoop": {"name": up_sqoop.name, "code": up_sqoop.getvalue().decode("utf-8")},
++                "project_id": project_id.strip() or "project_01"}
++        if up_ddl:
++            body["ddl"] = {"name": up_ddl.name, "code": up_ddl.getvalue().decode("utf-8")}
++        elif trino_url.strip():
++            body.update(trino_url=trino_url.strip(), trino_schema=trino_schema.strip() or None)
++        for key, value in [("target_catalog", target_catalog), ("target_namespace", target_namespace),
++                           ("target_storage", target_storage)]:
++            if value.strip():
++                body[key] = value.strip()
++        with st.spinner("Converting the Sqoop jobs..."):
++            data, err = api("POST", base_url, "/api/sqoop-yaml", json_body=body, timeout=180)
++        if err:
++            st.session_state.pop("sqoop_yaml", None)
++            st.error(err)
++        else:
++            st.session_state["sqoop_yaml"] = data
++
++    result = st.session_state.get("sqoop_yaml")
++    if result:
++        s = result["summary"]
++        m1, m2, m3, m4, m5 = st.columns(5)
++        m1.metric("Jobs", s["jobs"])
++        m2.metric("Full loads", s["full"])
++        m3.metric("Incremental loads", s["incremental"])
++        m4.metric("Findings", s["findings"])
++        m5.metric("Blocking execution", s["blocking_execution"])
++        st.caption("Every file is a proposed draft (execution_eligible: false) until a sqoop_to_spark schema and "
++                   "capability registry are installed and the findings are reviewed.")
++        for w in result["warnings"]:
++            st.warning(w)
++
++        st.subheader("Jobs")
++        st.dataframe(
++            [{"Job": j["job_id"], "Lines": j["lines"], "Saved job": j["saved_job"] or "-", "Load mode": j["load_mode"],
++              "Source": j["source"], "Columns mapped": j["columns"], "Findings": j["findings"],
++              "Blocking execution": j["blocking_execution"]} for j in result["jobs"]],
++            use_container_width=True, hide_index=True)
++
++        st.subheader("Findings")
++        st.dataframe(
++            [{"Job": f["job"], "Id": f["id"], "Category": f["category"], "Severity": f["severity"],
++              "Blocks": f["blocks"], "Evidence": f["evidence"], "Resolution": f["resolution"]}
++             for f in result["findings"]],
++            use_container_width=True, hide_index=True)
++
++        st.subheader("Coverage: how every Sqoop option was handled")
++        st.dataframe(
++            [{"Job": c["job"], "Option": c["construct"], "Status": c["status"],
++              "YAML path, finding or reason": c["detail"]} for c in result["coverage"]],
++            use_container_width=True, hide_index=True)
++
++        st.subheader("YAML")
++        yamls = result["yaml"]
++        if yamls:
++            job = st.selectbox("Job", list(yamls))
++            st.code(yamls[job], language="yaml")
++            yaml_files = result["files"]["yaml"]
++            buf = io.BytesIO()
++            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
++                for job_id, text in yamls.items():
++                    zf.writestr(os.path.basename(yaml_files[job_id]), text)
++            y1, y2, y3, y4 = st.columns(4)
++            y1.download_button("Download this YAML", yamls[job], file_name=os.path.basename(yaml_files[job]),
++                               mime="application/x-yaml")
++            y2.download_button("Download all YAML (ZIP)", buf.getvalue(),
++                               file_name=os.path.basename(result["folder"]) + ".zip", mime="application/zip")
++            for col, key, label, mime in [(y3, "markdown", "Download summary (Markdown)", "text/markdown"),
++                                          (y4, "json", "Download summary (JSON)", "application/json")]:
++                text = read_text(result["files"][key])
++                if text is not None:
++                    col.download_button(label, text, file_name=os.path.basename(result["files"][key]), mime=mime)
++        else:
++            st.info("No Sqoop command was found in the file.")
++        st.caption(f"Saved to {result['folder']}")
++
+ # ---------- run ----------
+ 
+ with tab_run:
+-- 
+2.43.0
+
+
+From 12364199bcf43f36671c3d6be70f88e5d1e4dd2c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 21 Oct 2026 01:24:59 +0000
+Subject: [PATCH 2/2] Add the Sqoop POC source SQL files and test against the
+ real schema
+
+sqoop_poc/01_schema.sql, 02_data.sql and 03_incremental_changes.sql are the files the
+POC notebook runs. The tests now use the real 01_schema.sql instead of a rebuilt
+fixture; all seven jobs give the same findings as the original POC run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018dZtx9qosUQnq7gAPRGRNh
+---
+ README.md                              |   7 +-
+ sqoop_poc/01_schema.sql                |  87 +++++++++++++++
+ sqoop_poc/02_data.sql                  | 140 +++++++++++++++++++++++++
+ sqoop_poc/03_incremental_changes.sql   |  33 ++++++
+ tests/fixtures/sqoop_source_schema.sql |  56 ----------
+ tests/test_sqoop_yaml.py               |   4 +-
+ 6 files changed, 266 insertions(+), 61 deletions(-)
+ create mode 100644 sqoop_poc/01_schema.sql
+ create mode 100644 sqoop_poc/02_data.sql
+ create mode 100644 sqoop_poc/03_incremental_changes.sql
+ delete mode 100644 tests/fixtures/sqoop_source_schema.sql
+
+diff --git a/README.md b/README.md
+index daf1521..439a14d 100644
+--- a/README.md
++++ b/README.md
+@@ -162,7 +162,7 @@ Deterministic tool (no LLM, no Sqoop), wired like the Spark comparison: module +
+ (upload the commands and, optionally, the source DDL; set the Iceberg target; view, download or ZIP the YAML files).
+ 
+ ```
+-python -m agentic.sqoop_yaml samples/sqoop_jobs.txt --ddl 01_schema.sql \
++python -m agentic.sqoop_yaml samples/sqoop_jobs.txt --ddl sqoop_poc/01_schema.sql \
+        --project-id sqoop_poc --target-catalog ice --target-namespace sqoop_poc_iceberg \
+        --target-storage hdfs://172.16.0.4:9000/user/hive/warehouse/sqoop_poc_iceberg.db
+ ```
+@@ -193,8 +193,9 @@ What every file guarantees:
+   capability registry and the findings are reviewed.
+ 
+ `sqoop_poc/sqoop_postgres_to_hive_poc.ipynb` builds the Postgres source and runs the Sqoop jobs (it reads the Postgres
+-password from `PG_PASSWORD` or prompts; it needs `01_schema.sql`, `02_data.sql` and `03_incremental_changes.sql` next to
+-it). `sqoop_poc/sqoop_to_yaml.ipynb` runs the converter and shows the findings and coverage.
++password from `PG_PASSWORD` or prompts) with `sqoop_poc/01_schema.sql` (source tables: enum, JSONB, array,
++timestamptz, composite key, a table with no key), `02_data.sql` (generated data) and `03_incremental_changes.sql` (a day of
++changes for the incremental jobs). `sqoop_poc/sqoop_to_yaml.ipynb` runs the converter and shows the findings and coverage.
+ `tests/test_sqoop_yaml.py` checks that the output matches the YAML the original POC script generated.
+ 
+ ## LLM providers
+diff --git a/sqoop_poc/01_schema.sql b/sqoop_poc/01_schema.sql
+new file mode 100644
+index 0000000..0dfa955
+--- /dev/null
++++ b/sqoop_poc/01_schema.sql
+@@ -0,0 +1,87 @@
++-- 01_schema.sql : source schema for the Sqoop POC (PostgreSQL)
++-- Deliberately awkward for a Sqoop import: enum, JSONB, array, timestamptz, composite PK,
++-- a table with no PK, nullable columns, NUMERIC with scale, free text with delimiters/newlines.
++
++DROP SCHEMA IF EXISTS retail CASCADE;
++CREATE SCHEMA retail;
++
++CREATE TYPE retail.segment_t AS ENUM ('RETAIL', 'SME', 'CORPORATE', 'PRIVATE');
++
++CREATE TABLE retail.branches (
++    branch_code  VARCHAR(10) PRIMARY KEY,
++    branch_name  TEXT        NOT NULL,
++    city         TEXT,
++    state_code   CHAR(2),
++    opened_date  DATE,
++    is_active    BOOLEAN     NOT NULL DEFAULT TRUE
++);
++
++CREATE TABLE retail.customers (
++    customer_id    BIGSERIAL PRIMARY KEY,
++    customer_ref   VARCHAR(12)  NOT NULL UNIQUE,
++    full_name      TEXT         NOT NULL,
++    email          TEXT,                                  -- nullable
++    segment        retail.segment_t NOT NULL,             -- enum (Sqoop cannot map it directly)
++    country        CHAR(2)      NOT NULL,
++    kyc_status     VARCHAR(10)  NOT NULL CHECK (kyc_status IN ('VERIFIED', 'PENDING', 'EXPIRED')),
++    pep_flag       BOOLEAN      NOT NULL DEFAULT FALSE,
++    date_of_birth  DATE,                                  -- nullable
++    onboard_ts     TIMESTAMPTZ  NOT NULL,                 -- time zone aware
++    address        JSONB,                                 -- semi-structured
++    tags           TEXT[],                                -- array, nullable, sometimes empty
++    notes          TEXT,                                  -- commas, quotes, newlines, tabs, unicode
++    updated_at     TIMESTAMP    NOT NULL DEFAULT now()
++);
++
++CREATE TABLE retail.accounts (
++    account_id    BIGSERIAL PRIMARY KEY,
++    account_no    VARCHAR(14)   NOT NULL UNIQUE,
++    customer_id   BIGINT        NOT NULL REFERENCES retail.customers (customer_id),
++    account_type  VARCHAR(10)   NOT NULL,
++    currency      CHAR(3)       NOT NULL,
++    branch_code   VARCHAR(10)   REFERENCES retail.branches (branch_code),
++    balance       NUMERIC(18,2) NOT NULL DEFAULT 0,       -- can be negative
++    credit_limit  NUMERIC(18,2),                          -- only for cards
++    status        VARCHAR(8)    NOT NULL,
++    open_date     DATE          NOT NULL,
++    close_date    DATE,                                   -- null unless CLOSED
++    updated_at    TIMESTAMP     NOT NULL DEFAULT now()    -- used for lastmodified incremental
++);
++
++-- many-to-many with a COMPOSITE primary key (Sqoop needs --split-by for this one)
++CREATE TABLE retail.account_holders (
++    account_id   BIGINT       NOT NULL REFERENCES retail.accounts (account_id),
++    customer_id  BIGINT       NOT NULL REFERENCES retail.customers (customer_id),
++    holder_role  VARCHAR(10)  NOT NULL,
++    share_pct    NUMERIC(5,2) NOT NULL,
++    since_date   DATE,
++    PRIMARY KEY (account_id, customer_id)
++);
++
++-- big table: used for parallel mappers and append-style incremental import
++CREATE TABLE retail.transactions (
++    txn_id        BIGSERIAL PRIMARY KEY,
++    account_id    BIGINT        NOT NULL REFERENCES retail.accounts (account_id),
++    txn_ts        TIMESTAMP     NOT NULL,
++    txn_type      VARCHAR(10)   NOT NULL,
++    amount        NUMERIC(18,2) NOT NULL,
++    status        VARCHAR(10)   NOT NULL,
++    channel       VARCHAR(10),
++    counterparty  VARCHAR(40),
++    memo          TEXT,
++    updated_at    TIMESTAMP     NOT NULL DEFAULT now()
++);
++
++-- NO primary key and contains duplicate rows (Sqoop falls back to 1 mapper or needs --split-by)
++CREATE TABLE retail.fx_rates_log (
++    rate_date  DATE          NOT NULL,
++    currency   CHAR(3)       NOT NULL,
++    usd_rate   NUMERIC(18,6) NOT NULL,
++    source     VARCHAR(12),
++    loaded_at  TIMESTAMP     NOT NULL DEFAULT now()
++);
++
++CREATE INDEX idx_accounts_customer     ON retail.accounts (customer_id);
++CREATE INDEX idx_accounts_updated      ON retail.accounts (updated_at);
++CREATE INDEX idx_transactions_account  ON retail.transactions (account_id);
++CREATE INDEX idx_transactions_ts       ON retail.transactions (txn_ts);
+diff --git a/sqoop_poc/02_data.sql b/sqoop_poc/02_data.sql
+new file mode 100644
+index 0000000..7dd6a9b
+--- /dev/null
++++ b/sqoop_poc/02_data.sql
+@@ -0,0 +1,140 @@
++-- 02_data.sql : generates the data (server side, deterministic via setseed)
++--   branches 40 | customers 10,000 | accounts 15,000 | account_holders ~18,000
++--   transactions 200,000 | fx_rates_log 900 + ~90 duplicates
++
++SELECT setseed(0.42);
++
++-- ------------------------------------------------------------------ branches
++INSERT INTO retail.branches (branch_code, branch_name, city, state_code, opened_date, is_active)
++SELECT 'BR' || lpad(g::text, 3, '0'),
++       'Branch ' || g,
++       (ARRAY['Pittsburgh','Philadelphia','Newark','Cleveland','Baltimore','Atlanta','Chicago','Dallas'])[1 + g % 8],
++       (ARRAY['PA','PA','NJ','OH','MD','GA','IL','TX'])[1 + g % 8],
++       DATE '1990-01-01' + ((g * 173) % 9000),
++       (g % 11) <> 0
++FROM generate_series(1, 40) g;
++
++-- ------------------------------------------------------------------ customers
++INSERT INTO retail.customers
++    (customer_ref, full_name, email, segment, country, kyc_status, pep_flag,
++     date_of_birth, onboard_ts, address, tags, notes, updated_at)
++SELECT 'CIF' || lpad(g::text, 8, '0'),
++       (ARRAY['Aisha','Omar','Priya','José','Sofia','Chen','Fatima','Noah','Elena','Ravi','Zoë','Hassan'])[1 + floor(random() * 12)::int]
++         || ' ' ||
++       (ARRAY['Khan','Patel','O''Brien','Müller','Garcia','Smith','Nguyen','Ahmed','李','Rossi','Silva','Taylor'])[1 + floor(random() * 12)::int],
++       CASE WHEN random() < 0.08 THEN NULL ELSE 'user' || g || '@example.com' END,
++       (ARRAY['RETAIL','RETAIL','RETAIL','SME','CORPORATE','PRIVATE'])[1 + floor(random() * 6)::int]::retail.segment_t,
++       (ARRAY['US','US','US','GB','DE','IN','PK','AE','SG','CA'])[1 + floor(random() * 10)::int],
++       (ARRAY['VERIFIED','VERIFIED','VERIFIED','VERIFIED','PENDING','EXPIRED'])[1 + floor(random() * 6)::int],
++       random() < 0.02,
++       CASE WHEN random() < 0.05 THEN NULL ELSE DATE '1950-01-01' + floor(random() * 20000)::int END,
++       TIMESTAMPTZ '2012-01-01 00:00:00+00' + random() * interval '5000 days',
++       jsonb_build_object(
++           'line1', (1 + floor(random() * 9998))::int || ' Main St, Apt ' || (1 + g % 50),
++           'city',  (ARRAY['Pittsburgh','Newark','Austin','London','Berlin','Mumbai'])[1 + floor(random() * 6)::int],
++           'zip',   lpad((floor(random() * 99999))::int::text, 5, '0'),
++           'geo',   jsonb_build_object('lat', round((random() * 60)::numeric, 4), 'lon', round((random() * 120)::numeric, 4))),
++       CASE WHEN random() < 0.30 THEN NULL
++            WHEN random() < 0.15 THEN '{}'::text[]
++            WHEN random() < 0.50 THEN ARRAY['mobile', 'paperless']
++            ELSE ARRAY['branch-visitor'] END,
++       CASE g % 7
++            WHEN 0 THEN NULL
++            WHEN 1 THEN 'Prefers email, not phone'
++            WHEN 2 THEN 'Said "call after 5pm"'
++            WHEN 3 THEN E'Line one\nLine two'
++            WHEN 4 THEN E'Tab\tseparated\tnote'
++            WHEN 5 THEN 'Unicode: 北京 / São Paulo'
++            ELSE '' END,
++       now() - random() * interval '365 days'
++FROM generate_series(1, 10000) g;
++
++-- ------------------------------------------------------------------ accounts
++WITH base AS (
++    SELECT g,
++           (ARRAY['ACTIVE','ACTIVE','ACTIVE','ACTIVE','DORMANT','CLOSED'])[1 + floor(random() * 6)::int] AS status,
++           (ARRAY['SAVINGS','CURRENT','CURRENT','LOAN','CARD'])[1 + floor(random() * 5)::int]           AS account_type,
++           DATE '2012-01-01' + floor(random() * 4500)::int                                              AS open_date
++    FROM generate_series(1, 15000) g
++)
++INSERT INTO retail.accounts
++    (account_no, customer_id, account_type, currency, branch_code, balance, credit_limit,
++     status, open_date, close_date, updated_at)
++SELECT 'AC' || lpad(g::text, 12, '0'),
++       1 + floor(random() * 10000)::bigint,
++       account_type,
++       (ARRAY['USD','USD','USD','EUR','GBP','INR','AED','SGD','CAD','AUD'])[1 + floor(random() * 10)::int],
++       'BR' || lpad((1 + floor(random() * 40))::int::text, 3, '0'),
++       CASE WHEN random() < 0.05 THEN -round((random() * 5000)::numeric, 2)
++            ELSE round((random() * 90000)::numeric, 2) END,
++       CASE WHEN account_type = 'CARD' THEN round((1000 + random() * 20000)::numeric, 2) END,
++       status,
++       open_date,
++       CASE WHEN status = 'CLOSED' THEN LEAST(open_date + floor(random() * 1500)::int, CURRENT_DATE) END,
++       now() - random() * interval '90 days'
++FROM base;
++
++-- ------------------------------------------------------------------ account_holders (composite PK)
++INSERT INTO retail.account_holders (account_id, customer_id, holder_role, share_pct, since_date)
++SELECT account_id, customer_id, 'PRIMARY', 100.00, open_date
++FROM retail.accounts;
++
++INSERT INTO retail.account_holders (account_id, customer_id, holder_role, share_pct, since_date)
++SELECT a.account_id, a.joint_id, 'JOINT', 50.00, a.open_date
++FROM (SELECT account_id, customer_id, open_date, 1 + floor(random() * 10000)::bigint AS joint_id
++      FROM retail.accounts
++      WHERE random() < 0.20) a
++WHERE a.joint_id <> a.customer_id
++ON CONFLICT DO NOTHING;
++
++UPDATE retail.account_holders
++SET share_pct = 50.00
++WHERE holder_role = 'PRIMARY'
++  AND account_id IN (SELECT account_id FROM retail.account_holders WHERE holder_role = 'JOINT');
++
++-- ------------------------------------------------------------------ transactions (200k)
++INSERT INTO retail.transactions
++    (account_id, txn_ts, txn_type, amount, status, channel, counterparty, memo, updated_at)
++SELECT s.account_id,
++       s.txn_ts,
++       s.txn_type,
++       CASE WHEN random() < 0.001 THEN round((250000 + random() * 250000)::numeric, 2)   -- outliers
++            WHEN random() < 0.01  THEN 0.00                                              -- zero amounts
++            ELSE round((random() * 2000)::numeric, 2) END,
++       (ARRAY['POSTED','POSTED','POSTED','POSTED','POSTED','PENDING','REVERSED','FAILED'])[1 + floor(random() * 8)::int],
++       CASE WHEN random() < 0.10 THEN NULL
++            ELSE (ARRAY['BRANCH','ATM','ONLINE','MOBILE'])[1 + floor(random() * 4)::int] END,
++       CASE WHEN s.txn_type IN ('CASH_DEP', 'CASH_WDL') THEN NULL
++            ELSE 'REF' || lpad((floor(random() * 999999999))::bigint::text, 9, '0') END,
++       CASE (floor(random() * 8))::int
++            WHEN 0 THEN NULL
++            WHEN 1 THEN 'Invoice 1042, March'
++            WHEN 2 THEN 'Rent "May" payment'
++            WHEN 3 THEN E'Split bill\nsecond line'
++            WHEN 4 THEN E'Ref\tTAB\tseparated'
++            WHEN 5 THEN 'Café ☕ Zürich'
++            WHEN 6 THEN ''
++            ELSE 'ordinary memo' END,
++       s.txn_ts
++FROM (SELECT 1 + floor(random() * 15000)::bigint AS account_id,
++             now()::timestamp - random() * interval '60 days' AS txn_ts,
++             (ARRAY['CASH_DEP','CASH_WDL','TRANSFER','TRANSFER','CARD','CARD','CHEQUE'])[1 + floor(random() * 7)::int] AS txn_type
++      FROM generate_series(1, 200000)) s;
++
++-- ------------------------------------------------------------------ fx_rates_log (no PK, duplicates)
++INSERT INTO retail.fx_rates_log (rate_date, currency, usd_rate, source)
++SELECT CURRENT_DATE - d,
++       c.ccy,
++       round((c.base * (1 + (random() - 0.5) * 0.02))::numeric, 6),
++       (ARRAY['ECB','REUTERS','BLOOMBERG'])[1 + floor(random() * 3)::int]
++FROM generate_series(0, 89) d,
++     (VALUES ('USD', 1.0), ('EUR', 1.08), ('GBP', 1.27), ('INR', 0.012), ('PKR', 0.0036),
++             ('AED', 0.2723), ('SGD', 0.74), ('CAD', 0.73), ('AUD', 0.66), ('JPY', 0.0067)) AS c(ccy, base);
++
++-- ~10% of rows loaded twice (duplicate natural keys, slightly different rate/source)
++INSERT INTO retail.fx_rates_log (rate_date, currency, usd_rate, source)
++SELECT rate_date, currency, round((usd_rate * 1.0005)::numeric, 6), 'REUTERS'
++FROM retail.fx_rates_log
++WHERE random() < 0.10;
++
++ANALYZE;
+diff --git a/sqoop_poc/03_incremental_changes.sql b/sqoop_poc/03_incremental_changes.sql
+new file mode 100644
+index 0000000..d99e76f
+--- /dev/null
++++ b/sqoop_poc/03_incremental_changes.sql
+@@ -0,0 +1,33 @@
++-- 03_incremental_changes.sql : simulate a day of source activity between two Sqoop runs
++--   * 5,000 new transactions  -> picked up by the append incremental job (check column txn_id)
++--   * 300 accounts changed    -> picked up by the lastmodified incremental job (check column updated_at)
++--   * 50 new accounts         -> also picked up by lastmodified
++
++INSERT INTO retail.transactions
++    (account_id, txn_ts, txn_type, amount, status, channel, counterparty, memo, updated_at)
++SELECT 1 + floor(random() * 15000)::bigint,
++       now()::timestamp - random() * interval '2 hours',
++       (ARRAY['CASH_DEP','CASH_WDL','TRANSFER','CARD','CHEQUE'])[1 + floor(random() * 5)::int],
++       round((random() * 1500)::numeric, 2),
++       'POSTED',
++       (ARRAY['BRANCH','ATM','ONLINE','MOBILE'])[1 + floor(random() * 4)::int],
++       'REF' || lpad((floor(random() * 999999999))::bigint::text, 9, '0'),
++       'incremental batch',
++       now()::timestamp
++FROM generate_series(1, 5000);
++
++UPDATE retail.accounts
++SET balance    = balance + round((random() * 500)::numeric, 2),
++    status     = CASE WHEN status = 'DORMANT' THEN 'ACTIVE' ELSE status END,
++    updated_at = now()
++WHERE account_id IN (SELECT account_id FROM retail.accounts ORDER BY random() LIMIT 300);
++
++INSERT INTO retail.accounts
++    (account_no, customer_id, account_type, currency, branch_code, balance, credit_limit, status, open_date, updated_at)
++SELECT 'AC' || lpad((15000 + g)::text, 12, '0'),
++       1 + floor(random() * 10000)::bigint,
++       'SAVINGS', 'USD',
++       'BR' || lpad((1 + floor(random() * 40))::int::text, 3, '0'),
++       round((random() * 1000)::numeric, 2),
++       NULL, 'ACTIVE', CURRENT_DATE, now()
++FROM generate_series(1, 50) g;
+diff --git a/tests/fixtures/sqoop_source_schema.sql b/tests/fixtures/sqoop_source_schema.sql
+deleted file mode 100644
+index aa809df..0000000
+--- a/tests/fixtures/sqoop_source_schema.sql
++++ /dev/null
+@@ -1,56 +0,0 @@
+--- Test fixture: source tables of the Sqoop POC (Postgres schema "retail"), rebuilt from the column lists in the
+--- POC notebook. Not the POC's 01_schema.sql; customers (enum, JSONB, text[]) is left out on purpose because the
+--- POC imports it through a free-form query.
+-CREATE TABLE retail.branches (
+-    branch_code  VARCHAR(8)   PRIMARY KEY,
+-    branch_name  VARCHAR(80)  NOT NULL,
+-    city         VARCHAR(60),
+-    state_code   CHAR(2),
+-    opened_date  DATE,
+-    is_active    BOOLEAN      NOT NULL DEFAULT true
+-);
+-
+-CREATE TABLE retail.accounts (
+-    account_id    BIGSERIAL     PRIMARY KEY,
+-    account_no    VARCHAR(20)   NOT NULL UNIQUE,
+-    customer_id   BIGINT        NOT NULL REFERENCES retail.customers (customer_id),
+-    account_type  VARCHAR(12)   NOT NULL,
+-    currency      CHAR(3)       NOT NULL,
+-    branch_code   VARCHAR(8)    REFERENCES retail.branches (branch_code),
+-    balance       NUMERIC(18,2) NOT NULL,
+-    credit_limit  NUMERIC(18,2),
+-    status        VARCHAR(10)   NOT NULL,
+-    open_date     DATE          NOT NULL,
+-    close_date    DATE,
+-    updated_at    TIMESTAMP     NOT NULL DEFAULT now()
+-);
+-
+-CREATE TABLE retail.account_holders (
+-    account_id   BIGINT       NOT NULL REFERENCES retail.accounts (account_id),
+-    customer_id  BIGINT       NOT NULL REFERENCES retail.customers (customer_id),
+-    holder_role  VARCHAR(10)  NOT NULL,
+-    share_pct    NUMERIC(5,2) NOT NULL,
+-    since_date   DATE,
+-    PRIMARY KEY (account_id, customer_id)
+-);
+-
+-CREATE TABLE retail.transactions (
+-    txn_id        BIGSERIAL     PRIMARY KEY,
+-    account_id    BIGINT        NOT NULL REFERENCES retail.accounts (account_id),
+-    txn_ts        TIMESTAMP     NOT NULL,
+-    txn_type      VARCHAR(12)   NOT NULL,
+-    amount        NUMERIC(18,2) NOT NULL,
+-    status        VARCHAR(10)   NOT NULL,
+-    channel       VARCHAR(10),
+-    counterparty  VARCHAR(120),
+-    memo          TEXT,
+-    updated_at    TIMESTAMP     NOT NULL DEFAULT now()
+-);
+-
+-CREATE TABLE retail.fx_rates_log (
+-    rate_date  DATE          NOT NULL,
+-    currency   CHAR(3)       NOT NULL,
+-    usd_rate   NUMERIC(18,6) NOT NULL,
+-    source     VARCHAR(20),
+-    loaded_at  TIMESTAMP     NOT NULL DEFAULT now()
+-);
+diff --git a/tests/test_sqoop_yaml.py b/tests/test_sqoop_yaml.py
+index db45d55..f05e196 100644
+--- a/tests/test_sqoop_yaml.py
++++ b/tests/test_sqoop_yaml.py
+@@ -17,7 +17,7 @@ from agentic.sqoop_yaml import Options, build_specs, convert, spec_yaml
+ HERE = os.path.dirname(os.path.abspath(__file__))
+ ROOT = os.path.dirname(HERE)
+ SQOOP = os.path.join(ROOT, "samples", "sqoop_jobs.txt")
+-DDL = os.path.join(HERE, "fixtures", "sqoop_source_schema.sql")
++DDL = os.path.join(ROOT, "sqoop_poc", "01_schema.sql")
+ EXPECTED = os.path.join(HERE, "fixtures", "sqoop_account_holders_expected.yaml")
+ NOTEBOOK_SKILL = ".agents/skills/sqoop-to-spark@94b4b18"
+ 
+@@ -123,7 +123,7 @@ class SqoopYamlApiCase(unittest.TestCase):
+ 
+     def test_convert_by_path(self):
+         r = self.client.post("/api/sqoop-yaml", json={
+-            "sqoop": {"path": "samples/sqoop_jobs.txt"}, "ddl": {"path": "tests/fixtures/sqoop_source_schema.sql"},
++            "sqoop": {"path": "samples/sqoop_jobs.txt"}, "ddl": {"path": "sqoop_poc/01_schema.sql"},
+             "project_id": "sqoop_poc", "target_catalog": "ice", "target_namespace": "sqoop_poc_iceberg",
+             "target_storage": "hdfs://nn:9000/warehouse/sqoop_poc_iceberg.db"})
+         self.assertEqual(r.status_code, 200, r.text)
+-- 
+2.43.0
+
